@@ -1,0 +1,48 @@
+# Xbox 360 binaries (do NOT commit game executables)
+Vigilante 8 Arcade
+Vigilante 8 Arcade.zip
+*.xex
+*.xexp
+*.xbe
+
+# Extracted game data (copyrighted content)
+extracted/
+
+# XenonRecomp toolchain (cloned locally)
+tools/XenonRecomp/
+
+# Tool build artifacts and intermediate files
+tools/*.bin
+tools/*.exe
+extract_pe.exe
+
+# Build artifacts
+build/
+out/
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# Generated recomp output (large, reproducible)
+ppc/
+
+# IDE / editor
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Claude Code local settings
+.claude/

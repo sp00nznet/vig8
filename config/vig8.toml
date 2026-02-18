@@ -1,0 +1,50 @@
+# Vigilante 8 Arcade - XenonRecomp Configuration
+# Generated: 2026-02-17
+
+[main]
+file_path = "../extracted/default.xex"
+out_directory_path = "../ppc"
+switch_table_file_path = "vig8_switch_tables.toml"
+
+# ABI Register Save/Restore Addresses
+# Found by scanning the XEX binary for standard PPC ABI function patterns
+savegprlr_14_address = 0x82310F00
+restgprlr_14_address = 0x82310F50
+savefpr_14_address = 0x82311720
+restfpr_14_address = 0x8231176C
+savevmx_14_address = 0x823117C0
+restvmx_14_address = 0x82311A58
+savevmx_64_address = 0x82311854
+restvmx_64_address = 0x82311AEC
+
+# setjmp/longjmp not found in this binary
+# longjmp_address = 0x00000000
+# setjmp_address = 0x00000000
+
+[optimizations]
+# All optimizations DISABLED for initial recompilation pass
+# Enable these ONLY after basic recompilation works correctly
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Manual function definitions (add as needed during iteration)
+# functions = [
+#     { address = 0x00000000, size = 0x00 },
+# ]
+
+# Invalid instruction skips (add as needed during iteration)
+# invalid_instructions = [
+#     { data = 0x00000000, size = 4 },
+# ]
+
+# Mid-ASM hooks (add as needed for runtime integration)
+# [[midasm_hook]]
+# name = "ExampleHook"
+# address = 0x00000000
+# registers = ["r3"]
