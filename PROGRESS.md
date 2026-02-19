@@ -9,7 +9,7 @@
 | 3. Configuration | TOML config, function definitions | DONE |
 | 4. Initial Recomp | First XenonRecomp pass, fix errors | DONE |
 | 4b. Instruction Support | Add 30+ missing Altivec/VMX to XenonRecomp | DONE |
-| 5. Runtime Skeleton | Minimal runtime to link & boot | NOT STARTED |
+| 5. Runtime Skeleton | Minimal runtime to link & boot | DONE |
 | 6. Graphics | Xenos -> D3D12/Vulkan rendering | NOT STARTED |
 | 7. Audio | Audio system implementation | NOT STARTED |
 | 8. Input | Controller/keyboard input | NOT STARTED |
@@ -130,14 +130,70 @@
 
 ---
 
+### 2026-02-18/19 - Runtime Skeleton & Successful Build
+
+**Completed:**
+- [x] Created CMakeLists.txt build system (CMake 3.20+, Clang, Ninja)
+- [x] Implemented 4GB PPC memory space with VirtualAlloc (Windows) / mmap (POSIX)
+- [x] Built PE image extraction tool (dump_pe.cpp) using XenonRecomp's XenonUtils
+- [x] Extracted decrypted/decompressed PE image from encrypted XEX
+- [x] Implemented PE data section loader (.rdata, .data, .embsec_*, etc.)
+- [x] Populated function lookup table (12,282 entries for PPC_LOOKUP_FUNC)
+- [x] Implemented 205 Xbox 360 kernel/system import stubs
+- [x] Added C23 math polyfill (roundevenf) for MSVC CRT compatibility
+- [x] **Successful full build: 19.7 MB native x86-64 executable**
+- [x] **Entry point (_xstart) reached: game CRT begins initialization**
+
+**Build System:**
+- `ppc_recomp` static library: 48 generated .cpp files + function mapping
+- `vig8` executable: runtime source (main, memory, xex_loader, kernel_stubs, math_polyfill)
+- Clang flags: `-O2 -fno-strict-aliasing -Wno-everything` (for generated code)
+- SIMDE headers from XenonRecomp thirdparty for SSE/AVX intrinsics
+
+**PE Image Extraction:**
+- XEX uses AES encryption (retail key) + LZX compression
+- File key at security_info + 0x150, decrypted via AES-CBC
+- Extracted 5,111,808 byte PE with 17 sections
+- Data sections loaded: .rdata (488KB), .data (1.1MB), .pdata, .idata, .reloc, etc.
+
+**Kernel Stubs (205 functions across 15 subsystems):**
+- Memory: NtAllocateVirtualMemory (bump allocator), MmAllocatePhysicalMemoryEx
+- Threading: ExCreateThread, KeWaitForSingleObject, KeTls* (single-threaded stubs)
+- Sync: RtlInitializeCriticalSection, Kf*SpinLock (no-ops for single-threaded)
+- Video: VdInitializeEngines, VdSwap, VdQueryVideoMode (1280x720 default)
+- Audio: XAudioRegisterRenderDriverClient, XMACreateContext
+- Input: XamInputGetState (ERROR_DEVICE_NOT_CONNECTED)
+- Network: NetDll_* (all return errors/disconnected)
+- File I/O: NtOpenFile, NtReadFile (return OBJECT_NAME_NOT_FOUND)
+- C runtime: sprintf, _vsnprintf, DbgPrint (simplified stubs)
+
+**Runtime Execution Progress:**
+The recompiled executable successfully:
+1. Allocates 4GB PPC address space
+2. Loads PE data sections (989KB)
+3. Populates 12,282 function table entries
+4. Calls _xstart entry point
+5. Executes NtAllocateVirtualMemory (1MB + 64KB allocations)
+6. Calls KeGetCurrentProcessType, RtlInitializeCriticalSection
+7. Crashes during CRT initialization (access violation in deeper init code)
+
+**Known Issues:**
+- r2 (TOC) and r13 (SDA) not yet set from XEX header
+- CRT init crash needs investigation (likely related to missing TOC or import resolution)
+- Python XEX decryptor only handles basic block compression; C++ dump_pe tool handles LZX
+- NtAllocateVirtualMemory stub may need corrected parameter mapping
+
+---
+
 ## Next Steps
 
-1. Add 3 remaining switch table entries (computed jump tables at 0x8212DD34, 0x8219F5B4, 0x821A16B0)
-2. Begin runtime skeleton (PPCContext init, memory mapping, host entry point)
-3. Create CMakeLists.txt for building recompiled C++ into native executable
-4. Study UnleashedRecomp for runtime architecture reference
-5. Investigate the .ib/.ibz file format (game's custom asset format)
-6. Contribute instruction patches upstream to XenonRecomp
+1. Debug CRT initialization crash (likely TOC/r2 related)
+2. Investigate and set correct r2 (TOC) and r13 (SDA) values
+3. Improve NtAllocateVirtualMemory stub (handle requested base address, MEM_TOP_DOWN)
+4. Add 3 remaining switch table entries
+5. Implement basic file I/O stubs (for game data loading)
+6. Begin Xenos GPU command buffer parsing for graphics
+7. Contribute instruction patches upstream to XenonRecomp
 
 ---
 
