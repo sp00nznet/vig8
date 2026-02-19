@@ -7,7 +7,8 @@
 | 1. Setup | Repo, toolchain, documentation | DONE |
 | 2. Analysis | XenonAnalyse, ABI address hunting | DONE |
 | 3. Configuration | TOML config, function definitions | DONE |
-| 4. Initial Recomp | First XenonRecomp pass, fix errors | DONE (with issues) |
+| 4. Initial Recomp | First XenonRecomp pass, fix errors | DONE |
+| 4b. Instruction Support | Add 30+ missing Altivec/VMX to XenonRecomp | DONE |
 | 5. Runtime Skeleton | Minimal runtime to link & boot | NOT STARTED |
 | 6. Graphics | Xenos -> D3D12/Vulkan rendering | NOT STARTED |
 | 7. Audio | Audio system implementation | NOT STARTED |
@@ -71,12 +72,10 @@
 - ~10,299 unrecognized instructions (mostly Altivec/VMX operations)
 - 53 RC bit warnings (rldicl. instructions)
 
-**Issues to Fix:**
-1. **Switch case boundary errors (72):** Functions at 0x8211FBF4, 0x821368E0, 0x821A464C, etc. have switch cases that jump outside their detected function boundaries. Fix by adding manual `functions` entries in the TOML config to extend function boundaries.
-2. **Unrecognized instructions (~10,299):** Many Altivec/VMX and VMX128 instructions not yet handled: `vnor128`, `cctph`, `vsubshs`, `vaddsbs`, `vsrah`, `vcmpgtsh`, `vspltish`, `vmaxsh`, `vminsh`, `vavguh`, `eqv`, etc. These will need to be either:
-   - Added to XenonRecomp as new instruction handlers
-   - Handled via mid-ASM hooks in the runtime
-3. **RC bit warnings (53):** `rldicl.` instructions with Record bit - the comparison result isn't generated. May cause issues in conditional branches.
+**Issues Found (all resolved in Phase 4b):**
+1. ~~**Switch case boundary errors (72)**~~ - Fixed with manual function definitions in TOML
+2. ~~**Unrecognized instructions (10,299)**~~ - Fixed by adding 30+ instruction handlers to XenonRecomp
+3. ~~**RC bit warnings (53)**~~ - Fixed by adding CR update code to rldicl., vcmpgtub., vcmpgtuh.
 
 **Build Environment:**
 - Windows 11 Pro
@@ -86,15 +85,59 @@
 - Python 3.11.9
 - Visual Studio 2022 Community (MSVC 19.44)
 
+### 2026-02-18 - Clean Recompilation Achieved
+
+**Completed:**
+- [x] Added 30+ missing Altivec/VMX instruction handlers to XenonRecomp
+- [x] Fixed RC-bit (`.` suffix) handling for `rldicl.`, `vcmpgtub.`, `vcmpgtuh.`
+- [x] Added CR bit manipulation instructions (`cror`, `crorc`)
+- [x] Added integer logical instruction (`eqv`)
+- [x] Added Cell SPE hint instruction (`cctph` as no-op)
+- [x] Added `simde_mm_vctuxs()` helper for float->uint32 saturating conversion
+- [x] Achieved **clean recompilation** - 0 unrecognized instructions, 0 RC-bit warnings
+- [x] All 72 switch case boundary errors remain fixed from previous session
+
+**Instructions Added to XenonRecomp:**
+
+| Category | Instructions |
+|----------|-------------|
+| Vector saturating arithmetic | `vaddsbs`, `vaddsws`, `vsubsbs`, `vsubshs` |
+| Vector modular arithmetic | `vsububm` |
+| Vector shifts | `vslh`, `vsrh`, `vsrah`, `vsrab`, `vrlh` |
+| Vector shift octet | `vslo`, `vslo128` |
+| Vector compare | `vcmpequh`, `vcmpgtsh`, `vcmpgtsw` (all with RC bit) |
+| Vector min/max | `vmaxsh`, `vminsh` |
+| Vector average | `vavguh` |
+| Vector splat | `vspltish` |
+| Vector pack | `vpkshss`/128, `vpkswss`/128, `vpkswus`/128, `vpkuhus`/128 |
+| Vector logical | `vnor`/128 |
+| Float conversion | `vcfpuxws128` |
+| Integer logical | `eqv` |
+| CR bit ops | `cror`, `crorc` |
+| Hints | `cctph` (no-op) |
+
+**Bug Fixes:**
+- `vcmpgtub`: Added missing RC-bit (`.`) CR6 update
+- `vcmpgtuh`: Added missing RC-bit (`.`) CR6 update
+- `rldicl`: Added missing RC-bit (`.`) CR0 comparison
+
+**Recompilation Results (Pass 4 - Final):**
+- **0** unrecognized instructions (was 10,299)
+- **0** RC-bit warnings (was 53+14)
+- **0** switch case boundary errors (was 72)
+- **3** informational switch table notices (tables at 0x8212DD34, 0x8219F5B4, 0x821A16B0 need TOML entries)
+- **49** C++ source files generated (63 MB total)
+
 ---
 
 ## Next Steps
 
-1. Fix switch case boundary errors by adding manual function definitions
-2. Investigate unrecognized VMX instructions - may need to contribute patches to XenonRecomp or use invalid_instructions to skip non-code data
-3. Begin runtime skeleton (memory management, function dispatch)
+1. Add 3 remaining switch table entries (computed jump tables at 0x8212DD34, 0x8219F5B4, 0x821A16B0)
+2. Begin runtime skeleton (PPCContext init, memory mapping, host entry point)
+3. Create CMakeLists.txt for building recompiled C++ into native executable
 4. Study UnleashedRecomp for runtime architecture reference
 5. Investigate the .ib/.ibz file format (game's custom asset format)
+6. Contribute instruction patches upstream to XenonRecomp
 
 ---
 
@@ -104,4 +147,3 @@
 2. Does it have any title update patches (XEXP files)?
 3. What graphics API complexity do we expect? (Xenos shader count, render pipeline)
 4. Are there any known modding/reverse engineering resources for this game?
-5. How many of the "unrecognized instructions" are actually data embedded in code sections vs genuine instruction support gaps in XenonRecomp?

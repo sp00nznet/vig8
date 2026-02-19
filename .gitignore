@@ -44,5 +44,8 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
+# Recompilation logs (reproducible)
+*.log
+
 # Claude Code local settings
 .claude/
