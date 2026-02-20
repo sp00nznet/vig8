@@ -123,21 +123,21 @@ int main(int argc, char* argv[])
     // Step 4: Create Win32 window
     printf("\n[4/5] Creating window...\n");
     {
-        WNDCLASSEXW wc = {};
+        WNDCLASSEXA wc = {};
         wc.cbSize = sizeof(wc);
         wc.style = CS_HREDRAW | CS_VREDRAW;
         wc.lpfnWndProc = WndProc;
         wc.hInstance = GetModuleHandle(nullptr);
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-        wc.lpszClassName = L"Vig8WndClass";
-        RegisterClassExW(&wc);
+        wc.lpszClassName = "Vig8WndClass";
+        RegisterClassExA(&wc);
 
         RECT rc = {0, 0, 1280, 720};
         AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
 
-        g_hwnd = CreateWindowExW(
-            0, L"Vig8WndClass", L"Vigilante 8 Arcade",
+        g_hwnd = CreateWindowExA(
+            0, "Vig8WndClass", "Vigilante 8 Arcade",
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT, CW_USEDEFAULT,
             rc.right - rc.left, rc.bottom - rc.top,
