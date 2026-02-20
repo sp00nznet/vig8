@@ -6,6 +6,8 @@
 #include <cstdarg>
 #include <cstring>
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -96,6 +98,28 @@ static inline void ppc_write_u32(uint8_t* base, uint32_t addr, uint32_t val)
 static inline const char* ppc_string(uint8_t* base, uint32_t addr)
 {
     return reinterpret_cast<const char*>(base + addr);
+}
+
+// Helper: read a big-endian uint16 from PPC memory
+static inline uint16_t ppc_read_u16(uint8_t* base, uint32_t addr)
+{
+    uint8_t* p = base + addr;
+    return (uint16_t(p[0]) << 8) | uint16_t(p[1]);
+}
+
+// Helper: write a big-endian uint16 to PPC memory
+static inline void ppc_write_u16(uint8_t* base, uint32_t addr, uint16_t val)
+{
+    uint8_t* p = base + addr;
+    p[0] = (val >> 8) & 0xFF;
+    p[1] = val & 0xFF;
+}
+
+// Helper: write a big-endian uint64 to PPC memory
+static inline void ppc_write_u64(uint8_t* base, uint32_t addr, uint64_t val)
+{
+    ppc_write_u32(base, addr, (uint32_t)(val >> 32));
+    ppc_write_u32(base, addr + 4, (uint32_t)(val & 0xFFFFFFFF));
 }
 
 
@@ -673,25 +697,335 @@ PPC_FUNC(__imp__MmQueryAddressProtect)
 
 
 // ============================================================================
+// NT Kernel - File I/O: Handle Table & Path Translation
+// ============================================================================
+
+enum HandleType { HANDLE_NONE = 0, HANDLE_FILE, HANDLE_DIRECTORY };
+
+struct DirEntry
+{
+    std::string name;
+    int64_t     size;
+    bool        is_directory;
+};
+
+struct HandleEntry
+{
+    HandleType type;
+    FILE*      fp;
+    std::string host_path;
+    int64_t    file_size;
+    // Directory enumeration state
+    std::vector<DirEntry> dir_entries;
+    size_t dir_index;
+};
+
+static constexpr int    MAX_FILE_HANDLES = 128;
+static constexpr uint32_t FILE_HANDLE_BASE = 0x1000;
+static HandleEntry g_file_handles[MAX_FILE_HANDLES] = {};
+
+static int handle_alloc(HandleType type, FILE* fp, const std::string& path, int64_t size)
+{
+    for (int i = 0; i < MAX_FILE_HANDLES; i++)
+    {
+        if (g_file_handles[i].type == HANDLE_NONE)
+        {
+            g_file_handles[i].type = type;
+            g_file_handles[i].fp = fp;
+            g_file_handles[i].host_path = path;
+            g_file_handles[i].file_size = size;
+            g_file_handles[i].dir_entries.clear();
+            g_file_handles[i].dir_index = 0;
+            return i;
+        }
+    }
+    return -1; // no free slots
+}
+
+static HandleEntry* handle_lookup(uint32_t handle)
+{
+    if (handle < FILE_HANDLE_BASE) return nullptr;
+    int idx = (int)(handle - FILE_HANDLE_BASE);
+    if (idx < 0 || idx >= MAX_FILE_HANDLES) return nullptr;
+    if (g_file_handles[idx].type == HANDLE_NONE) return nullptr;
+    return &g_file_handles[idx];
+}
+
+static void handle_free(uint32_t handle)
+{
+    if (handle < FILE_HANDLE_BASE) return;
+    int idx = (int)(handle - FILE_HANDLE_BASE);
+    if (idx < 0 || idx >= MAX_FILE_HANDLES) return;
+    g_file_handles[idx].type = HANDLE_NONE;
+    g_file_handles[idx].fp = nullptr;
+    g_file_handles[idx].host_path.clear();
+    g_file_handles[idx].file_size = 0;
+    g_file_handles[idx].dir_entries.clear();
+    g_file_handles[idx].dir_index = 0;
+}
+
+// Parse ANSI_STRING from Xbox 360 OBJECT_ATTRIBUTES
+// X_OBJECT_ATTRIBUTES: +0x00 RootDirectory(u32), +0x04 ObjectName*(u32), +0x08 Attributes(u32)
+// ANSI_STRING: +0x00 Length(u16), +0x02 MaxLength(u16), +0x04 Buffer(u32)
+static std::string parse_object_name(uint8_t* base, uint32_t oa_addr)
+{
+    if (!oa_addr) return "";
+    uint32_t name_str_ptr = ppc_read_u32(base, oa_addr + 0x04);
+    if (!name_str_ptr) return "";
+    uint16_t name_len = ppc_read_u16(base, name_str_ptr);
+    uint32_t buf_addr = ppc_read_u32(base, name_str_ptr + 0x04);
+    if (!buf_addr || name_len == 0 || name_len >= 512) return "";
+    return std::string(reinterpret_cast<const char*>(base + buf_addr), name_len);
+}
+
+// Map Xbox 360 paths to host filesystem paths
+// "game:\..." -> "extracted/..."
+// "game:..." -> "extracted/..."
+static std::string xbox_path_to_host(const std::string& xbox_path)
+{
+    std::string path = xbox_path;
+    // Normalize backslashes to forward slashes
+    for (auto& c : path)
+        if (c == '\\') c = '/';
+
+    // Map "game:" prefix to "extracted/"
+    if (path.size() >= 5 && (path.substr(0, 5) == "game:" || path.substr(0, 5) == "GAME:"))
+    {
+        path = path.substr(5);
+        // Remove leading slash if present
+        if (!path.empty() && path[0] == '/')
+            path = path.substr(1);
+        path = "extracted/" + path;
+    }
+
+    return path;
+}
+
+
+// ============================================================================
 // NT Kernel - File I/O
 // ============================================================================
 
+// Shared implementation for NtOpenFile and NtCreateFile
+// r3=FileHandle*, r4=DesiredAccess, r5=ObjectAttributes*, r6=IoStatusBlock*
+static void NtOpenFile_impl(PPCContext& __restrict ctx, uint8_t* base)
+{
+    uint32_t handle_out_addr = ctx.r3.u32;
+    uint32_t oa_addr = ctx.r5.u32;
+    uint32_t iosb_addr = ctx.r6.u32;
+
+    std::string xbox_name = parse_object_name(base, oa_addr);
+    if (xbox_name.empty())
+    {
+        fprintf(stderr, "[FILE] NtOpenFile: (empty name)\n");
+        ctx.r3.u32 = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND
+        return;
+    }
+
+    std::string host_path = xbox_path_to_host(xbox_name);
+    fprintf(stderr, "[FILE] NtOpenFile: \"%s\" -> \"%s\"\n", xbox_name.c_str(), host_path.c_str());
+
+    // Detect directory open: trailing slash or host path is a directory
+    bool is_dir = false;
+    if (!host_path.empty() && host_path.back() == '/')
+        is_dir = true;
+
+#ifdef _WIN32
+    DWORD attrs = GetFileAttributesA(host_path.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY))
+        is_dir = true;
+    bool exists = (attrs != INVALID_FILE_ATTRIBUTES);
+#else
+    struct stat st;
+    bool exists = (stat(host_path.c_str(), &st) == 0);
+    if (exists && S_ISDIR(st.st_mode))
+        is_dir = true;
+#endif
+
+    if (!exists)
+    {
+        // Try without trailing slash for directories
+        std::string trimmed = host_path;
+        while (!trimmed.empty() && trimmed.back() == '/')
+            trimmed.pop_back();
+        if (!trimmed.empty() && trimmed != host_path)
+        {
+#ifdef _WIN32
+            attrs = GetFileAttributesA(trimmed.c_str());
+            exists = (attrs != INVALID_FILE_ATTRIBUTES);
+            if (exists && (attrs & FILE_ATTRIBUTE_DIRECTORY))
+                is_dir = true;
+#else
+            exists = (stat(trimmed.c_str(), &st) == 0);
+            if (exists && S_ISDIR(st.st_mode))
+                is_dir = true;
+#endif
+            if (exists) host_path = trimmed;
+        }
+    }
+
+    if (!exists)
+    {
+        fprintf(stderr, "[FILE]   -> NOT FOUND\n");
+        ctx.r3.u32 = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND
+        return;
+    }
+
+    if (is_dir)
+    {
+        int slot = handle_alloc(HANDLE_DIRECTORY, nullptr, host_path, 0);
+        if (slot < 0)
+        {
+            fprintf(stderr, "[FILE]   -> no free handle slots!\n");
+            ctx.r3.u32 = 0xC000009A; // STATUS_INSUFFICIENT_RESOURCES
+            return;
+        }
+
+        // Enumerate directory contents at open time
+        HandleEntry& he = g_file_handles[slot];
+#ifdef _WIN32
+        // Ensure path doesn't end with slash for FindFirstFile
+        std::string search = host_path;
+        while (!search.empty() && search.back() == '/')
+            search.pop_back();
+        search += "/*";
+        WIN32_FIND_DATAA fd;
+        HANDLE hFind = FindFirstFileA(search.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE)
+        {
+            do {
+                if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
+                    continue;
+                DirEntry de;
+                de.name = fd.cFileName;
+                de.size = ((int64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+                de.is_directory = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                he.dir_entries.push_back(de);
+            } while (FindNextFileA(hFind, &fd));
+            FindClose(hFind);
+        }
+#else
+        DIR* d = opendir(host_path.c_str());
+        if (d)
+        {
+            struct dirent* ent;
+            while ((ent = readdir(d)) != nullptr)
+            {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                    continue;
+                DirEntry de;
+                de.name = ent->d_name;
+                de.is_directory = (ent->d_type == DT_DIR);
+                // Get file size
+                std::string full = host_path + "/" + de.name;
+                struct stat st;
+                if (stat(full.c_str(), &st) == 0)
+                    de.size = st.st_size;
+                else
+                    de.size = 0;
+                he.dir_entries.push_back(de);
+            }
+            closedir(d);
+        }
+#endif
+        fprintf(stderr, "[FILE]   -> directory handle 0x%X (%zu entries)\n",
+                FILE_HANDLE_BASE + (uint32_t)slot, he.dir_entries.size());
+
+        uint32_t handle = FILE_HANDLE_BASE + (uint32_t)slot;
+        ppc_write_u32(base, handle_out_addr, handle);
+        if (iosb_addr)
+        {
+            ppc_write_u32(base, iosb_addr, 0);
+            ppc_write_u32(base, iosb_addr + 4, 1); // FILE_OPENED
+        }
+        ctx.r3.u32 = 0; // STATUS_SUCCESS
+        return;
+    }
+
+    // Regular file
+    FILE* fp = fopen(host_path.c_str(), "rb");
+    if (!fp)
+    {
+        fprintf(stderr, "[FILE]   -> fopen failed\n");
+        ctx.r3.u32 = 0xC0000034;
+        return;
+    }
+
+    // Get file size
+    _fseeki64(fp, 0, SEEK_END);
+    int64_t fsize = _ftelli64(fp);
+    _fseeki64(fp, 0, SEEK_SET);
+
+    int slot = handle_alloc(HANDLE_FILE, fp, host_path, fsize);
+    if (slot < 0)
+    {
+        fclose(fp);
+        fprintf(stderr, "[FILE]   -> no free handle slots!\n");
+        ctx.r3.u32 = 0xC000009A;
+        return;
+    }
+    uint32_t handle = FILE_HANDLE_BASE + (uint32_t)slot;
+    ppc_write_u32(base, handle_out_addr, handle);
+    if (iosb_addr)
+    {
+        ppc_write_u32(base, iosb_addr, 0);
+        ppc_write_u32(base, iosb_addr + 4, 1); // FILE_OPENED
+    }
+    fprintf(stderr, "[FILE]   -> file handle 0x%X (size=%lld)\n", handle, (long long)fsize);
+    ctx.r3.u32 = 0; // STATUS_SUCCESS
+}
+
 PPC_FUNC(__imp__NtOpenFile)
 {
-    STUB_LOG("NtOpenFile");
-    ctx.r3.u32 = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND
+    NtOpenFile_impl(ctx, base);
 }
 
 PPC_FUNC(__imp__NtCreateFile)
 {
-    STUB_LOG("NtCreateFile");
-    ctx.r3.u32 = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND
+    // NtCreateFile has same first 4 args as NtOpenFile (r3-r6)
+    NtOpenFile_impl(ctx, base);
 }
 
 PPC_FUNC(__imp__NtReadFile)
 {
-    STUB_LOG("NtReadFile");
-    ctx.r3.u32 = 0xC0000008; // STATUS_INVALID_HANDLE
+    // r3=FileHandle, r4=Event, r5=ApcRoutine, r6=ApcContext,
+    // r7=IoStatusBlock*, r8=Buffer(PPC addr), r9=Length, r10=ByteOffset*
+    uint32_t handle_val = ctx.r3.u32;
+    uint32_t iosb_addr = ctx.r7.u32;
+    uint32_t buf_addr = ctx.r8.u32;
+    uint32_t length = ctx.r9.u32;
+    uint32_t offset_ptr = ctx.r10.u32;
+
+    HandleEntry* entry = handle_lookup(handle_val);
+    if (!entry || entry->type != HANDLE_FILE || !entry->fp)
+    {
+        fprintf(stderr, "[FILE] NtReadFile: invalid handle 0x%X\n", handle_val);
+        ctx.r3.u32 = 0xC0000008; // STATUS_INVALID_HANDLE
+        return;
+    }
+
+    // Seek if ByteOffset provided
+    if (offset_ptr)
+    {
+        uint32_t off_hi = ppc_read_u32(base, offset_ptr);
+        uint32_t off_lo = ppc_read_u32(base, offset_ptr + 4);
+        int64_t offset = ((int64_t)off_hi << 32) | off_lo;
+        _fseeki64(entry->fp, offset, SEEK_SET);
+    }
+
+    // Read directly into PPC memory (raw bytes, no endian swap needed for file data)
+    size_t bytes_read = fread(base + buf_addr, 1, length, entry->fp);
+
+    // Fill IO_STATUS_BLOCK
+    if (iosb_addr)
+    {
+        ppc_write_u32(base, iosb_addr, 0); // Status = SUCCESS
+        ppc_write_u32(base, iosb_addr + 4, (uint32_t)bytes_read);
+    }
+
+    fprintf(stderr, "[FILE] NtReadFile: handle=0x%X, requested=%u, read=%zu\n",
+            handle_val, length, bytes_read);
+    ctx.r3.u32 = 0; // STATUS_SUCCESS
 }
 
 PPC_FUNC(__imp__NtReadFileScatter)
@@ -702,14 +1036,102 @@ PPC_FUNC(__imp__NtReadFileScatter)
 
 PPC_FUNC(__imp__NtWriteFile)
 {
-    STUB_LOG("NtWriteFile");
-    ctx.r3.u32 = 0xC0000008;
+    // Stub: claim all bytes written successfully
+    uint32_t iosb_addr = ctx.r7.u32;
+    uint32_t length = ctx.r9.u32;
+    if (iosb_addr)
+    {
+        ppc_write_u32(base, iosb_addr, 0); // STATUS_SUCCESS
+        ppc_write_u32(base, iosb_addr + 4, length);
+    }
+    STUB_LOG_ONCE("NtWriteFile");
+    ctx.r3.u32 = 0; // STATUS_SUCCESS
 }
 
 PPC_FUNC(__imp__NtQueryInformationFile)
 {
-    STUB_LOG("NtQueryInformationFile");
-    ctx.r3.u32 = 0xC0000008;
+    // r3=FileHandle, r4=IoStatusBlock*, r5=FileInformation*, r6=Length, r7=FileInformationClass
+    uint32_t handle_val = ctx.r3.u32;
+    uint32_t iosb_addr = ctx.r4.u32;
+    uint32_t info_addr = ctx.r5.u32;
+    uint32_t info_len = ctx.r6.u32;
+    uint32_t info_class = ctx.r7.u32;
+
+    HandleEntry* entry = handle_lookup(handle_val);
+    if (!entry)
+    {
+        fprintf(stderr, "[FILE] NtQueryInformationFile: invalid handle 0x%X\n", handle_val);
+        ctx.r3.u32 = 0xC0000008; // STATUS_INVALID_HANDLE
+        return;
+    }
+
+    fprintf(stderr, "[FILE] NtQueryInformationFile: handle=0x%X, class=%u\n", handle_val, info_class);
+
+    switch (info_class)
+    {
+    case 5: // FileStandardInformation
+    {
+        // AllocationSize(u64), EndOfFile(u64), NumberOfLinks(u32), DeletePending(u8), Directory(u8)
+        if (info_len >= 24)
+        {
+            memset(base + info_addr, 0, 24);
+            int64_t sz = entry->file_size;
+            ppc_write_u64(base, info_addr + 0, (uint64_t)sz); // AllocationSize
+            ppc_write_u64(base, info_addr + 8, (uint64_t)sz); // EndOfFile
+            ppc_write_u32(base, info_addr + 16, 1);           // NumberOfLinks
+            base[info_addr + 20] = 0;                         // DeletePending
+            base[info_addr + 21] = (entry->type == HANDLE_DIRECTORY) ? 1 : 0;
+        }
+        if (iosb_addr)
+        {
+            ppc_write_u32(base, iosb_addr, 0);
+            ppc_write_u32(base, iosb_addr + 4, 24);
+        }
+        ctx.r3.u32 = 0;
+        break;
+    }
+    case 14: // FilePositionInformation
+    {
+        // CurrentByteOffset(u64)
+        int64_t pos = 0;
+        if (entry->fp)
+            pos = _ftelli64(entry->fp);
+        if (info_len >= 8)
+            ppc_write_u64(base, info_addr, (uint64_t)pos);
+        if (iosb_addr)
+        {
+            ppc_write_u32(base, iosb_addr, 0);
+            ppc_write_u32(base, iosb_addr + 4, 8);
+        }
+        ctx.r3.u32 = 0;
+        break;
+    }
+    case 34: // FileNetworkOpenInformation
+    {
+        // CreationTime(u64), LastAccessTime(u64), LastWriteTime(u64), ChangeTime(u64),
+        // AllocationSize(u64), EndOfFile(u64), FileAttributes(u32)
+        if (info_len >= 56)
+        {
+            memset(base + info_addr, 0, 56);
+            int64_t sz = entry->file_size;
+            ppc_write_u64(base, info_addr + 32, (uint64_t)sz); // AllocationSize
+            ppc_write_u64(base, info_addr + 40, (uint64_t)sz); // EndOfFile
+            uint32_t attrs = (entry->type == HANDLE_DIRECTORY) ? 0x10 : 0x80; // DIR or NORMAL
+            ppc_write_u32(base, info_addr + 48, attrs);
+        }
+        if (iosb_addr)
+        {
+            ppc_write_u32(base, iosb_addr, 0);
+            ppc_write_u32(base, iosb_addr + 4, 56);
+        }
+        ctx.r3.u32 = 0;
+        break;
+    }
+    default:
+        fprintf(stderr, "[FILE]   -> unsupported info class %u\n", info_class);
+        ctx.r3.u32 = 0xC0000003; // STATUS_INVALID_INFO_CLASS
+        break;
+    }
 }
 
 PPC_FUNC(__imp__NtSetInformationFile)
@@ -726,8 +1148,156 @@ PPC_FUNC(__imp__NtQueryVolumeInformationFile)
 
 PPC_FUNC(__imp__NtQueryDirectoryFile)
 {
-    STUB_LOG("NtQueryDirectoryFile");
-    ctx.r3.u32 = 0xC0000008;
+    // Xbox 360 NtQueryDirectoryFile parameter layout (determined by register probing):
+    // r3=FileHandle, r4=Event(NULL), r5=ApcRoutine(NULL), r6=ApcContext(NULL),
+    // r7=IoStatusBlock*, r8=FileInformation*, r9=Length,
+    // r10=pointer whose first u32 is FileInformationClass
+    uint32_t handle_val = ctx.r3.u32;
+    uint32_t iosb_addr = ctx.r7.u32;
+    uint32_t info_buf = ctx.r8.u32;
+    uint32_t info_len = ctx.r9.u32;
+
+    // Read FileInformationClass from the struct pointed to by r10
+    uint32_t r10_val = ctx.r10.u32;
+    uint32_t info_class = 1; // default: FileDirectoryInformation
+    if (r10_val >= 0x82000000 && r10_val < 0xB0000000)
+        info_class = ppc_read_u32(base, r10_val);
+    else if (r10_val > 0 && r10_val < 100)
+        info_class = r10_val; // direct value
+
+    HandleEntry* entry = handle_lookup(handle_val);
+    if (!entry || entry->type != HANDLE_DIRECTORY)
+    {
+        fprintf(stderr, "[FILE] NtQueryDirectoryFile: invalid dir handle 0x%X\n", handle_val);
+        ctx.r3.u32 = 0xC0000008; // STATUS_INVALID_HANDLE
+        return;
+    }
+
+    if (entry->dir_index >= entry->dir_entries.size())
+    {
+        if (iosb_addr)
+        {
+            ppc_write_u32(base, iosb_addr, 0x80000006);
+            ppc_write_u32(base, iosb_addr + 4, 0);
+        }
+        ctx.r3.u32 = 0x80000006; // STATUS_NO_MORE_FILES
+        return;
+    }
+
+    // Determine header size based on info class
+    // Class 1: FileDirectoryInformation  - header 0x40, then ANSI filename
+    // Class 3: FileBothDirectoryInformation - header 0x5E, then ANSI filename
+    // Class 12: FileNamesInformation     - header 0x0C, then ANSI filename
+    uint32_t header_size;
+    switch (info_class)
+    {
+    case 1:  header_size = 0x40; break;
+    case 3:  header_size = 0x5E; break;
+    case 12: header_size = 0x0C; break;
+    default:
+        fprintf(stderr, "[FILE] NtQueryDirectoryFile: unsupported class %u\n", info_class);
+        ctx.r3.u32 = 0xC0000003; // STATUS_INVALID_INFO_CLASS
+        return;
+    }
+
+    // Pack as many entries as fit in the output buffer
+    uint32_t offset = 0;
+    uint32_t prev_entry_offset_pos = 0; // position of last NextEntryOffset field
+    bool first = true;
+    uint32_t entries_written = 0;
+
+    while (entry->dir_index < entry->dir_entries.size())
+    {
+        const DirEntry& de = entry->dir_entries[entry->dir_index];
+        uint32_t name_len = (uint32_t)de.name.size();
+        uint32_t entry_size = header_size + name_len;
+        // Align to 8 bytes for next entry
+        uint32_t aligned_size = (entry_size + 7) & ~7u;
+
+        if (offset + entry_size > info_len)
+        {
+            if (first)
+            {
+                // Buffer too small for even one entry
+                ctx.r3.u32 = 0x80000005; // STATUS_BUFFER_OVERFLOW
+                return;
+            }
+            break; // no room for more entries
+        }
+
+        uint32_t entry_addr = info_buf + offset;
+        // Zero the entry area
+        memset(base + entry_addr, 0, (offset + aligned_size <= info_len) ? aligned_size : entry_size);
+
+        // Link previous entry to this one
+        if (!first)
+            ppc_write_u32(base, prev_entry_offset_pos, offset - (prev_entry_offset_pos - info_buf));
+
+        prev_entry_offset_pos = entry_addr; // NextEntryOffset is at +0x00
+
+        if (info_class == 1) // FileDirectoryInformation
+        {
+            // +0x00 NextEntryOffset (u32) - filled later or 0
+            ppc_write_u32(base, entry_addr + 0x00, 0);
+            // +0x04 FileIndex (u32)
+            ppc_write_u32(base, entry_addr + 0x04, (uint32_t)entry->dir_index);
+            // +0x08 CreationTime (u64) - zeroed
+            // +0x10 LastAccessTime (u64) - zeroed
+            // +0x18 LastWriteTime (u64) - zeroed
+            // +0x20 ChangeTime (u64) - zeroed
+            // +0x28 EndOfFile (u64)
+            ppc_write_u64(base, entry_addr + 0x28, (uint64_t)de.size);
+            // +0x30 AllocationSize (u64)
+            ppc_write_u64(base, entry_addr + 0x30, (uint64_t)de.size);
+            // +0x38 FileAttributes (u32)
+            ppc_write_u32(base, entry_addr + 0x38, de.is_directory ? 0x10 : 0x80);
+            // +0x3C FileNameLength (u32)
+            ppc_write_u32(base, entry_addr + 0x3C, name_len);
+            // +0x40 FileName (ANSI)
+            memcpy(base + entry_addr + 0x40, de.name.c_str(), name_len);
+        }
+        else if (info_class == 3) // FileBothDirectoryInformation
+        {
+            ppc_write_u32(base, entry_addr + 0x00, 0); // NextEntryOffset
+            ppc_write_u32(base, entry_addr + 0x04, (uint32_t)entry->dir_index); // FileIndex
+            // +0x08..+0x27 timestamps - zeroed
+            ppc_write_u64(base, entry_addr + 0x28, (uint64_t)de.size); // EndOfFile
+            ppc_write_u64(base, entry_addr + 0x30, (uint64_t)de.size); // AllocationSize
+            ppc_write_u32(base, entry_addr + 0x38, de.is_directory ? 0x10 : 0x80); // Attributes
+            ppc_write_u32(base, entry_addr + 0x3C, name_len); // FileNameLength
+            ppc_write_u32(base, entry_addr + 0x40, 0); // EaSize
+            base[entry_addr + 0x44] = 0; // ShortNameLength
+            // +0x46 ShortName[24] - zeroed
+            // +0x5E FileName (ANSI)
+            memcpy(base + entry_addr + 0x5E, de.name.c_str(), name_len);
+        }
+        else if (info_class == 12) // FileNamesInformation
+        {
+            ppc_write_u32(base, entry_addr + 0x00, 0); // NextEntryOffset
+            ppc_write_u32(base, entry_addr + 0x04, (uint32_t)entry->dir_index); // FileIndex
+            ppc_write_u32(base, entry_addr + 0x08, name_len); // FileNameLength
+            // +0x0C FileName (ANSI)
+            memcpy(base + entry_addr + 0x0C, de.name.c_str(), name_len);
+        }
+
+        entry->dir_index++;
+        entries_written++;
+        first = false;
+        offset += aligned_size;
+    }
+
+    // Last entry has NextEntryOffset = 0 (already written)
+
+    if (iosb_addr)
+    {
+        ppc_write_u32(base, iosb_addr, 0); // STATUS_SUCCESS
+        ppc_write_u32(base, iosb_addr + 4, offset); // bytes written
+    }
+
+    fprintf(stderr, "[FILE] NtQueryDirectoryFile: handle=0x%X, class=%u, %u entries returned (%u/%zu)\n",
+            handle_val, info_class, entries_written,
+            (uint32_t)entry->dir_index, entry->dir_entries.size());
+    ctx.r3.u32 = 0; // STATUS_SUCCESS
 }
 
 PPC_FUNC(__imp__NtFlushBuffersFile)
@@ -738,7 +1308,16 @@ PPC_FUNC(__imp__NtFlushBuffersFile)
 
 PPC_FUNC(__imp__NtClose)
 {
-    STUB_LOG_ONCE("NtClose");
+    uint32_t handle_val = ctx.r3.u32;
+    HandleEntry* entry = handle_lookup(handle_val);
+    if (entry)
+    {
+        fprintf(stderr, "[FILE] NtClose: handle=0x%X (\"%s\")\n", handle_val, entry->host_path.c_str());
+        if (entry->fp)
+            fclose(entry->fp);
+        handle_free(handle_val);
+    }
+    // Silently succeed for non-file handles (events, threads, etc.)
     ctx.r3.u32 = 0;
 }
 

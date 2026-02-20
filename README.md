@@ -14,7 +14,7 @@ Unlike emulation (which interprets instructions at runtime), static recompilatio
 
 See [PROGRESS.md](PROGRESS.md) for detailed progress tracking.
 
-**Current Phase:** Game boots and runs main loop with Win32 window (no rendering yet)
+**Current Phase:** Game boots, enumerates game data files, runs main loop with Win32 window (no rendering yet)
 
 | Milestone | Status |
 |-----------|--------|
@@ -31,6 +31,7 @@ See [PROGRESS.md](PROGRESS.md) for detailed progress tracking.
 | CRT initialization & game boot | Done |
 | Game main loop running (Update/Render cycle) | Done |
 | Win32 window (1280x720, message pump) | Done |
+| File I/O: handle table, path translation, directory enumeration | Done |
 | Graphics (Xenos -> D3D12/Vulkan) | Not Started |
 | Audio / Input / Integration | Not Started |
 
@@ -59,7 +60,8 @@ vig8/
 │   └── extract_pe.py              # Python XEX decryption tool (requires pycryptodome)
 ├── extracted/                     # Extracted game files (gitignored)
 │   ├── default.xex                # Xbox 360 executable
-│   └── pe_image.bin               # Decrypted/decompressed PE image
+│   ├── pe_image.bin               # Decrypted/decompressed PE image
+│   └── data/                      # 38 game data files (.ib/.ibz)
 ├── ppc/                           # Generated C++ output (gitignored, reproducible)
 ├── build/                         # CMake build directory (gitignored)
 ├── CMakeLists.txt                 # Build system (Clang + Ninja)

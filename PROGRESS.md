@@ -12,6 +12,7 @@
 | 5. Runtime Skeleton | Minimal runtime to link & boot | DONE |
 | 5b. Game Boot | Fix CRT init, get game loop running | DONE |
 | 5c. Window | Win32 window with message pump | DONE |
+| 5d. File I/O | Handle table, path translation, directory enumeration | DONE |
 | 6. Graphics | Xenos -> D3D12/Vulkan rendering | NOT STARTED |
 | 7. Audio | Audio system implementation | NOT STARTED |
 | 8. Input | Controller/keyboard input | NOT STARTED |
@@ -166,7 +167,7 @@
 - Audio: XAudioRegisterRenderDriverClient, XMACreateContext
 - Input: XamInputGetState (ERROR_DEVICE_NOT_CONNECTED)
 - Network: NetDll_* (all return errors/disconnected)
-- File I/O: NtOpenFile, NtReadFile (return OBJECT_NAME_NOT_FOUND)
+- File I/O: NtOpenFile, NtCreateFile, NtReadFile, NtWriteFile, NtQueryInformationFile, NtQueryDirectoryFile, NtClose (real implementations with handle table & path translation)
 - C runtime: sprintf, _vsnprintf, DbgPrint (simplified stubs)
 
 **Runtime Execution Progress:**
@@ -221,7 +222,8 @@ MmAllocatePhysicalMemoryEx (64MB GPU memory), XGetVideoMode,
 VdInitializeEngines, VdSetGraphicsInterruptCallback,
 XexGetModuleHandle/XexGetProcedureAddress (xam.xex, xboxkrnl.exe),
 XAudioRegisterRenderDriverClient, XamGetSystemVersion,
-XamNotifyCreateListener, NtOpenFile (x3), VdGetSystemCommandBuffer, VdSwap
+XamNotifyCreateListener, NtOpenFile (data dir), NtQueryDirectoryFile (38 entries),
+VdGetSystemCommandBuffer, VdSwap
 
 ---
 
@@ -246,13 +248,39 @@ XamNotifyCreateListener, NtOpenFile (x3), VdGetSystemCommandBuffer, VdSwap
 
 ---
 
+### 2026-02-19 - File I/O: Handle Table, Path Translation & Directory Enumeration
+
+**Completed:**
+- [x] **Handle table system:** 128-slot handle table (handles start at 0x1000 to avoid collision with event/thread handles at 0x100+). `HandleEntry` struct tracks type (file/directory), FILE*, host path, file size, and directory enumeration state.
+- [x] **Path translation:** `xbox_path_to_host()` maps `game:\...` to `extracted/...` with backslash normalization. `parse_object_name()` reads ANSI_STRING from Xbox 360 OBJECT_ATTRIBUTES structs.
+- [x] **NtOpenFile / NtCreateFile:** Real implementation. Detects directories (trailing slash, `GetFileAttributesA`), opens files with `fopen("rb")`, caches file size via `_ftelli64`. Both share `NtOpenFile_impl()`.
+- [x] **NtReadFile:** Seeks to `ByteOffset` (big-endian LARGE_INTEGER) if provided, reads directly into PPC memory via `fread()`. Fills IO_STATUS_BLOCK.
+- [x] **NtWriteFile:** Stub returning success (claims all bytes written).
+- [x] **NtQueryInformationFile:** Supports class 5 (FileStandardInformation: file size, is-directory), class 14 (FilePositionInformation: `_ftelli64`), class 34 (FileNetworkOpenInformation: size + attributes).
+- [x] **NtQueryDirectoryFile:** Full directory enumeration. Enumerates at open time via `FindFirstFileA`/`FindNextFileA`. Packs multiple entries per call with NextEntryOffset linking. Supports info class 1 (FileDirectoryInformation, 0x40 header) and class 3 (FileBothDirectoryInformation, 0x5E header). Returns `STATUS_NO_MORE_FILES` when exhausted.
+- [x] **NtClose:** Handle-aware — closes FILE* and frees handle slot for file handles, silently succeeds for event/thread handles.
+- [x] **Big-endian helpers:** Added `ppc_read_u16`, `ppc_write_u16`, `ppc_write_u64`.
+
+**Xbox 360 ABI Discovery:**
+- NtQueryDirectoryFile uses the full 11-parameter NT signature (r3-r10 + stack), but r10 contains a **pointer** whose first u32 is the FileInformationClass value (not the value directly). Discovered via register probing at runtime.
+- The game opens `game:\data\` once, enumerates all 38 data files (.ib/.ibz), builds an internal file list, then enters the main render loop.
+
+**Game Data Files (38 in extracted/data/):**
+- Config/metadata: `Config.ib`, `default.ib`, `microflakemap.ib`, `weaponparams.ibz`
+- Characters: `boogie.ib`, `chassey.ib`, `dave.ib`, `molo.ib`, `torque.ib`
+- Vehicles: `GrooVan.ibz`, `Incarcerator.ibz`, `Leprechaun.ibz`, `Mammoth.ibz`, `Manta.ibz`, `Piranha.ibz`, `Saucer.ibz`, `Stag.ibz`
+- Levels: `Farmland.ibz`, `FartyDog.ibz`, `HooverDam.ibz`, `Jefferson.ibz`, `MeteorCrater.ibz`, `OilFields.ibz`, `SkiResort.ibz`
+- UI/effects: `hud.ibz`, `menu.ibz`, `Debris.ibz`, `Particles.ibz`, `Surface.ibz`, `Weapons.ibz`
+- Audio/text: `sounds.ib`, `v8theme.ib`, `Text_ENG.ibz`, `Text_FRE.ibz`, `Text_GER.ibz`, `Text_ITA.ibz`, `Text_JAP.ibz`, `Text_SPA.ibz`
+
+---
+
 ## Next Steps
 
 1. Begin Xenos GPU command buffer parsing for graphics
 2. Create D3D12/Vulkan device and swap chain on the window
 3. Implement actual thread execution for ExCreateThread (game creates 3-4 threads)
-4. Implement basic file I/O (for game data loading from extracted/ directory)
-5. Contribute instruction patches upstream to XenonRecomp
+4. Contribute instruction patches upstream to XenonRecomp
 
 ---
 
