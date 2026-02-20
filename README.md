@@ -47,7 +47,7 @@ vig8/
 │   ├── xenonrecomp-workflow.md
 │   └── binary-analysis.md
 ├── src/                           # Runtime implementation source code
-│   ├── main.cpp                   # Entry point, PPC context setup, launches _xstart
+│   ├── main.cpp                   # Entry point, Win32 window, PPC context setup, launches _xstart
 │   ├── memory.cpp/h               # 4GB PPC memory space (VirtualAlloc/mmap)
 │   ├── xex_loader.cpp/h           # PE image data section loader
 │   ├── kernel_stubs.cpp           # 205 Xbox 360 kernel/XAM/system stubs

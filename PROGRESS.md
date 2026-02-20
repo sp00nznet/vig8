@@ -236,6 +236,7 @@ XamNotifyCreateListener, NtOpenFile (x3), VdGetSystemCommandBuffer, VdSwap
 - [x] `g_hwnd` global declared in `memory.h`, defined in `main.cpp`
 - [x] CMakeLists.txt links `user32`/`gdi32` explicitly
 - [x] Black background brush (window starts black, ready for future D3D surface)
+- [x] **Fix:** Use ANSI Win32 APIs (`CreateWindowExA`) instead of wide-char — `UNICODE` not defined, causing `L"Vigilante 8 Arcade"` to truncate to `"V"`
 
 **What This Enables:**
 - Visible window for future D3D rendering surface
