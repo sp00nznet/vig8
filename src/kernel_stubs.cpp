@@ -107,19 +107,65 @@ static inline uint16_t ppc_read_u16(uint8_t* base, uint32_t addr)
     return (uint16_t(p[0]) << 8) | uint16_t(p[1]);
 }
 
-// Helper: write a big-endian uint16 to PPC memory
-static inline void ppc_write_u16(uint8_t* base, uint32_t addr, uint16_t val)
-{
-    uint8_t* p = base + addr;
-    p[0] = (val >> 8) & 0xFF;
-    p[1] = val & 0xFF;
-}
-
 // Helper: write a big-endian uint64 to PPC memory
 static inline void ppc_write_u64(uint8_t* base, uint32_t addr, uint64_t val)
 {
     ppc_write_u32(base, addr, (uint32_t)(val >> 32));
     ppc_write_u32(base, addr + 4, (uint32_t)(val & 0xFFFFFFFF));
+}
+
+// ============================================================================
+// Thread management (single-threaded model)
+// ============================================================================
+
+// Queued thread start routines for single-threaded execution
+struct PendingThread
+{
+    uint32_t handle;        // handle assigned to this thread
+    uint32_t start_routine; // PPC address
+    uint32_t start_context; // PPC address passed as r3
+    uint32_t api_startup;   // PPC address of ApiThreadStartup wrapper
+    bool     suspended;     // created in suspended state
+    bool     ran;           // already executed
+};
+
+static constexpr int MAX_PENDING_THREADS = 16;
+static PendingThread g_pending_threads[MAX_PENDING_THREADS] = {};
+static int g_pending_thread_count = 0;
+
+// Run a pending thread inline (single-threaded model)
+static void run_thread_inline(PendingThread& pt, int idx, PPCContext& __restrict ctx, uint8_t* base)
+{
+    if (pt.ran || !pt.start_routine) return;
+    pt.ran = true;
+
+    uint32_t func_addr = pt.start_routine;
+    if (func_addr >= PPC_MEM_CODE_BASE &&
+        func_addr < PPC_MEM_CODE_BASE + PPC_MEM_CODE_SIZE)
+    {
+        typedef void (*PPCFuncPtr)(PPCContext& __restrict, uint8_t*);
+        PPCFuncPtr fn = PPC_LOOKUP_FUNC(base, func_addr);
+        if (fn)
+        {
+            fprintf(stderr, "[THREAD] Running thread %d (handle=0x%X): routine=0x%08X, context=0x%08X\n",
+                    idx, pt.handle, func_addr, pt.start_context);
+            uint32_t saved_r3 = ctx.r3.u32;
+            uint32_t saved_lr = ctx.lr;
+            ctx.r3.u32 = pt.start_context;
+            fn(ctx, base);
+            ctx.r3.u32 = saved_r3;
+            ctx.lr = saved_lr;
+            fprintf(stderr, "[THREAD] Thread %d returned\n", idx);
+        }
+        else
+        {
+            fprintf(stderr, "[THREAD] Thread %d: no function at 0x%08X\n", idx, func_addr);
+        }
+    }
+    else
+    {
+        fprintf(stderr, "[THREAD] Thread %d: routine 0x%08X outside code range\n", idx, func_addr);
+    }
 }
 
 
@@ -309,7 +355,29 @@ PPC_FUNC(__imp__KeSetBasePriorityThread)
 
 PPC_FUNC(__imp__KeResumeThread)
 {
-    STUB_LOG_ONCE("KeResumeThread");
+    // r3 = PKTHREAD (thread object pointer)
+    // On Xbox 360, this is a kernel thread object, not a handle.
+    // We treat it as a handle since we assigned handles in ExCreateThread.
+    uint32_t thread_ref = ctx.r3.u32;
+    fprintf(stderr, "[THREAD] KeResumeThread: ref=0x%08X\n", thread_ref);
+
+    // Search pending threads - try matching by handle
+    for (int i = 0; i < g_pending_thread_count; i++)
+    {
+        PendingThread& pt = g_pending_threads[i];
+        if (pt.handle == thread_ref && pt.suspended && !pt.ran)
+        {
+            fprintf(stderr, "[THREAD] Resuming suspended thread %d (handle=0x%X)\n", i, pt.handle);
+            pt.suspended = false;
+            run_thread_inline(pt, i, ctx, base);
+            ctx.r3.u32 = 1; // previous suspend count
+            return;
+        }
+    }
+
+    // Not found by handle - maybe the game passed something else.
+    // Log and succeed silently.
+    fprintf(stderr, "[THREAD] KeResumeThread: no matching suspended thread for ref=0x%08X\n", thread_ref);
     ctx.r3.u32 = 0;
 }
 
@@ -560,12 +628,26 @@ PPC_FUNC(__imp__RtlUnicodeToMultiByteN)
 PPC_FUNC(__imp__RtlNtStatusToDosError)
 {
     // r3 = NTSTATUS, returns DOS error
-    STUB_LOG_ONCE("RtlNtStatusToDosError");
-    // Simple mapping: 0 → 0, anything else → generic error
-    if (ctx.r3.u32 == 0)
-        ctx.r3.u32 = 0; // ERROR_SUCCESS
-    else
-        ctx.r3.u32 = 1; // ERROR_INVALID_FUNCTION
+    uint32_t status = ctx.r3.u32;
+    uint32_t dos_err;
+    switch (status)
+    {
+    case 0x00000000: dos_err = 0; break;    // STATUS_SUCCESS -> ERROR_SUCCESS
+    case 0x80000005: dos_err = 234; break;  // STATUS_BUFFER_OVERFLOW -> ERROR_MORE_DATA
+    case 0x80000006: dos_err = 18; break;   // STATUS_NO_MORE_FILES -> ERROR_NO_MORE_FILES
+    case 0xC0000008: dos_err = 6; break;    // STATUS_INVALID_HANDLE -> ERROR_INVALID_HANDLE
+    case 0xC0000017: dos_err = 8; break;    // STATUS_NO_MEMORY -> ERROR_NOT_ENOUGH_MEMORY
+    case 0xC0000034: dos_err = 2; break;    // STATUS_OBJECT_NAME_NOT_FOUND -> ERROR_FILE_NOT_FOUND
+    case 0xC000003A: dos_err = 3; break;    // STATUS_OBJECT_PATH_NOT_FOUND -> ERROR_PATH_NOT_FOUND
+    case 0xC0000035: dos_err = 183; break;  // STATUS_OBJECT_NAME_COLLISION -> ERROR_ALREADY_EXISTS
+    case 0xC000009A: dos_err = 8; break;    // STATUS_INSUFFICIENT_RESOURCES -> ERROR_NOT_ENOUGH_MEMORY
+    case 0xC0000003: dos_err = 87; break;   // STATUS_INVALID_INFO_CLASS -> ERROR_INVALID_PARAMETER
+    default:
+        fprintf(stderr, "[STUB] RtlNtStatusToDosError: unmapped NTSTATUS 0x%08X\n", status);
+        dos_err = 1; // ERROR_INVALID_FUNCTION (fallback)
+        break;
+    }
+    ctx.r3.u32 = dos_err;
 }
 
 PPC_FUNC(__imp__RtlUnwind)
@@ -1157,13 +1239,15 @@ PPC_FUNC(__imp__NtQueryDirectoryFile)
     uint32_t info_buf = ctx.r8.u32;
     uint32_t info_len = ctx.r9.u32;
 
-    // Read FileInformationClass from the struct pointed to by r10
-    uint32_t r10_val = ctx.r10.u32;
-    uint32_t info_class = 1; // default: FileDirectoryInformation
-    if (r10_val >= 0x82000000 && r10_val < 0xB0000000)
-        info_class = ppc_read_u32(base, r10_val);
-    else if (r10_val > 0 && r10_val < 100)
-        info_class = r10_val; // direct value
+    // Xbox 360 NtQueryDirectoryFile parameter layout (from PPC code analysis):
+    //   r3=FileHandle, r4=Event(0), r5=ApcRoutine(0), r6=ApcContext(0),
+    //   r7=IoStatusBlock*, r8=FileInformation*, r9=Length,
+    //   r10=FileName (ANSI_STRING* filter, or NULL for continuation)
+    //
+    // Xbox 360 always uses FileDirectoryInformation (class 1) with 0x40 header.
+    // r10 is the filename filter, NOT the FileInformationClass.
+    // (Confirmed: Xenia only implements X_FILE_DIRECTORY_INFORMATION for class 1)
+    uint32_t info_class = 1; // Always class 1 on Xbox 360
 
     HandleEntry* entry = handle_lookup(handle_val);
     if (!entry || entry->type != HANDLE_DIRECTORY)
@@ -1184,21 +1268,8 @@ PPC_FUNC(__imp__NtQueryDirectoryFile)
         return;
     }
 
-    // Determine header size based on info class
-    // Class 1: FileDirectoryInformation  - header 0x40, then ANSI filename
-    // Class 3: FileBothDirectoryInformation - header 0x5E, then ANSI filename
-    // Class 12: FileNamesInformation     - header 0x0C, then ANSI filename
-    uint32_t header_size;
-    switch (info_class)
-    {
-    case 1:  header_size = 0x40; break;
-    case 3:  header_size = 0x5E; break;
-    case 12: header_size = 0x0C; break;
-    default:
-        fprintf(stderr, "[FILE] NtQueryDirectoryFile: unsupported class %u\n", info_class);
-        ctx.r3.u32 = 0xC0000003; // STATUS_INVALID_INFO_CLASS
-        return;
-    }
+    // FileDirectoryInformation (class 1): 0x40 header, then ANSI filename
+    uint32_t header_size = 0x40;
 
     // Pack as many entries as fit in the output buffer
     uint32_t offset = 0;
@@ -1235,50 +1306,25 @@ PPC_FUNC(__imp__NtQueryDirectoryFile)
 
         prev_entry_offset_pos = entry_addr; // NextEntryOffset is at +0x00
 
-        if (info_class == 1) // FileDirectoryInformation
-        {
-            // +0x00 NextEntryOffset (u32) - filled later or 0
-            ppc_write_u32(base, entry_addr + 0x00, 0);
-            // +0x04 FileIndex (u32)
-            ppc_write_u32(base, entry_addr + 0x04, (uint32_t)entry->dir_index);
-            // +0x08 CreationTime (u64) - zeroed
-            // +0x10 LastAccessTime (u64) - zeroed
-            // +0x18 LastWriteTime (u64) - zeroed
-            // +0x20 ChangeTime (u64) - zeroed
-            // +0x28 EndOfFile (u64)
-            ppc_write_u64(base, entry_addr + 0x28, (uint64_t)de.size);
-            // +0x30 AllocationSize (u64)
-            ppc_write_u64(base, entry_addr + 0x30, (uint64_t)de.size);
-            // +0x38 FileAttributes (u32)
-            ppc_write_u32(base, entry_addr + 0x38, de.is_directory ? 0x10 : 0x80);
-            // +0x3C FileNameLength (u32)
-            ppc_write_u32(base, entry_addr + 0x3C, name_len);
-            // +0x40 FileName (ANSI)
-            memcpy(base + entry_addr + 0x40, de.name.c_str(), name_len);
-        }
-        else if (info_class == 3) // FileBothDirectoryInformation
-        {
-            ppc_write_u32(base, entry_addr + 0x00, 0); // NextEntryOffset
-            ppc_write_u32(base, entry_addr + 0x04, (uint32_t)entry->dir_index); // FileIndex
-            // +0x08..+0x27 timestamps - zeroed
-            ppc_write_u64(base, entry_addr + 0x28, (uint64_t)de.size); // EndOfFile
-            ppc_write_u64(base, entry_addr + 0x30, (uint64_t)de.size); // AllocationSize
-            ppc_write_u32(base, entry_addr + 0x38, de.is_directory ? 0x10 : 0x80); // Attributes
-            ppc_write_u32(base, entry_addr + 0x3C, name_len); // FileNameLength
-            ppc_write_u32(base, entry_addr + 0x40, 0); // EaSize
-            base[entry_addr + 0x44] = 0; // ShortNameLength
-            // +0x46 ShortName[24] - zeroed
-            // +0x5E FileName (ANSI)
-            memcpy(base + entry_addr + 0x5E, de.name.c_str(), name_len);
-        }
-        else if (info_class == 12) // FileNamesInformation
-        {
-            ppc_write_u32(base, entry_addr + 0x00, 0); // NextEntryOffset
-            ppc_write_u32(base, entry_addr + 0x04, (uint32_t)entry->dir_index); // FileIndex
-            ppc_write_u32(base, entry_addr + 0x08, name_len); // FileNameLength
-            // +0x0C FileName (ANSI)
-            memcpy(base + entry_addr + 0x0C, de.name.c_str(), name_len);
-        }
+        // X_FILE_DIRECTORY_INFORMATION (class 1, Xbox 360 layout):
+        // +0x00 NextEntryOffset (u32) - filled later or 0
+        ppc_write_u32(base, entry_addr + 0x00, 0);
+        // +0x04 FileIndex (u32)
+        ppc_write_u32(base, entry_addr + 0x04, (uint32_t)entry->dir_index);
+        // +0x08 CreationTime (u64) - zeroed
+        // +0x10 LastAccessTime (u64) - zeroed
+        // +0x18 LastWriteTime (u64) - zeroed
+        // +0x20 ChangeTime (u64) - zeroed
+        // +0x28 EndOfFile (u64)
+        ppc_write_u64(base, entry_addr + 0x28, (uint64_t)de.size);
+        // +0x30 AllocationSize (u64)
+        ppc_write_u64(base, entry_addr + 0x30, (uint64_t)de.size);
+        // +0x38 FileAttributes (u32)
+        ppc_write_u32(base, entry_addr + 0x38, de.is_directory ? 0x10 : 0x80);
+        // +0x3C FileNameLength (u32)
+        ppc_write_u32(base, entry_addr + 0x3C, name_len);
+        // +0x40 FileName (ANSI, not null-terminated)
+        memcpy(base + entry_addr + 0x40, de.name.c_str(), name_len);
 
         entry->dir_index++;
         entries_written++;
@@ -1294,8 +1340,8 @@ PPC_FUNC(__imp__NtQueryDirectoryFile)
         ppc_write_u32(base, iosb_addr + 4, offset); // bytes written
     }
 
-    fprintf(stderr, "[FILE] NtQueryDirectoryFile: handle=0x%X, class=%u, %u entries returned (%u/%zu)\n",
-            handle_val, info_class, entries_written,
+    fprintf(stderr, "[FILE] NtQueryDirectoryFile: handle=0x%X, %u entries returned (%u/%zu)\n",
+            handle_val, entries_written,
             (uint32_t)entry->dir_index, entry->dir_entries.size());
     ctx.r3.u32 = 0; // STATUS_SUCCESS
 }
@@ -1389,7 +1435,29 @@ PPC_FUNC(__imp__NtWaitForMultipleObjectsEx)
 
 PPC_FUNC(__imp__NtResumeThread)
 {
-    STUB_LOG_ONCE("NtResumeThread");
+    // r3 = ThreadHandle, r4 = PreviousSuspendCount*
+    uint32_t thread_handle = ctx.r3.u32;
+    uint32_t prev_count_ptr = ctx.r4.u32;
+    fprintf(stderr, "[THREAD] NtResumeThread: handle=0x%08X\n", thread_handle);
+
+    for (int i = 0; i < g_pending_thread_count; i++)
+    {
+        PendingThread& pt = g_pending_threads[i];
+        if (pt.handle == thread_handle && pt.suspended && !pt.ran)
+        {
+            fprintf(stderr, "[THREAD] Resuming suspended thread %d (handle=0x%X)\n", i, pt.handle);
+            pt.suspended = false;
+            if (prev_count_ptr)
+                ppc_write_u32(base, prev_count_ptr, 1);
+            run_thread_inline(pt, i, ctx, base);
+            ctx.r3.u32 = 0; // STATUS_SUCCESS
+            return;
+        }
+    }
+
+    fprintf(stderr, "[THREAD] NtResumeThread: no matching suspended thread for handle=0x%08X\n", thread_handle);
+    if (prev_count_ptr)
+        ppc_write_u32(base, prev_count_ptr, 0);
     ctx.r3.u32 = 0;
 }
 
@@ -1402,11 +1470,28 @@ PPC_FUNC(__imp__ExCreateThread)
 {
     // r3 = ThreadHandle*, r4 = StackSize, r5 = ThreadId*, r6 = ApiThreadStartup,
     // r7 = StartRoutine, r8 = StartContext, r9 = CreateSuspended
-    STUB_LOG("ExCreateThread");
     uint32_t handle_ptr = ctx.r3.u32;
+    uint32_t api_startup = ctx.r6.u32;
+    uint32_t start_routine = ctx.r7.u32;
+    uint32_t start_context = ctx.r8.u32;
+    uint32_t suspended = ctx.r9.u32;
+    fprintf(stderr, "[THREAD] ExCreateThread: routine=0x%08X, context=0x%08X, suspended=%u\n",
+            start_routine, start_context, suspended);
+    uint32_t thread_handle = g_next_handle++;
     if (handle_ptr)
-        ppc_write_u32(base, handle_ptr, g_next_handle++);
-    // TODO: Actually create a thread for multi-threaded games
+        ppc_write_u32(base, handle_ptr, thread_handle);
+
+    // Queue the thread for later execution
+    if (start_routine && g_pending_thread_count < MAX_PENDING_THREADS)
+    {
+        g_pending_threads[g_pending_thread_count].handle = thread_handle;
+        g_pending_threads[g_pending_thread_count].start_routine = start_routine;
+        g_pending_threads[g_pending_thread_count].start_context = start_context;
+        g_pending_threads[g_pending_thread_count].api_startup = api_startup;
+        g_pending_threads[g_pending_thread_count].suspended = (suspended != 0);
+        g_pending_threads[g_pending_thread_count].ran = false;
+        g_pending_thread_count++;
+    }
     ctx.r3.u32 = 0;
 }
 
@@ -1507,8 +1592,16 @@ PPC_FUNC(__imp__ObDereferenceObject)
 
 PPC_FUNC(__imp__ObReferenceObjectByHandle)
 {
-    STUB_LOG_ONCE("ObReferenceObjectByHandle");
-    ctx.r3.u32 = 0;
+    // r3 = Handle, r4 = ObjectType, r5 = Object** (output pointer)
+    uint32_t handle = ctx.r3.u32;
+    uint32_t out_ptr = ctx.r5.u32;
+    fprintf(stderr, "[OBJ] ObReferenceObjectByHandle: handle=0x%X, out=0x%08X\n", handle, out_ptr);
+
+    // Write the handle value as the "object pointer" so KeResumeThread can match it
+    if (out_ptr)
+        ppc_write_u32(base, out_ptr, handle);
+
+    ctx.r3.u32 = 0; // STATUS_SUCCESS
 }
 
 PPC_FUNC(__imp__ObCreateSymbolicLink)
@@ -1635,8 +1728,23 @@ PPC_FUNC(__imp__VdPersistDisplay)
 PPC_FUNC(__imp__VdSwap)
 {
     // Frame swap - this is where we'd present the frame.
-    // Pump Win32 messages and sleep to prevent 100% CPU usage.
     STUB_LOG_ONCE("VdSwap");
+
+    // On first swap call, run any non-suspended pending thread start routines.
+    // Suspended threads are run when KeResumeThread/NtResumeThread is called.
+    static bool s_threads_launched = false;
+    if (!s_threads_launched && g_pending_thread_count > 0)
+    {
+        s_threads_launched = true;
+        for (int i = 0; i < g_pending_thread_count; i++)
+        {
+            PendingThread& pt = g_pending_threads[i];
+            if (pt.suspended) continue;
+            run_thread_inline(pt, i, ctx, base);
+        }
+    }
+
+    // Pump Win32 messages and sleep to prevent 100% CPU usage.
 #ifdef _WIN32
     MSG msg;
     while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))

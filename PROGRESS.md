@@ -257,12 +257,12 @@ VdGetSystemCommandBuffer, VdSwap
 - [x] **NtReadFile:** Seeks to `ByteOffset` (big-endian LARGE_INTEGER) if provided, reads directly into PPC memory via `fread()`. Fills IO_STATUS_BLOCK.
 - [x] **NtWriteFile:** Stub returning success (claims all bytes written).
 - [x] **NtQueryInformationFile:** Supports class 5 (FileStandardInformation: file size, is-directory), class 14 (FilePositionInformation: `_ftelli64`), class 34 (FileNetworkOpenInformation: size + attributes).
-- [x] **NtQueryDirectoryFile:** Full directory enumeration. Enumerates at open time via `FindFirstFileA`/`FindNextFileA`. Packs multiple entries per call with NextEntryOffset linking. Supports info class 1 (FileDirectoryInformation, 0x40 header) and class 3 (FileBothDirectoryInformation, 0x5E header). Returns `STATUS_NO_MORE_FILES` when exhausted.
+- [x] **NtQueryDirectoryFile:** Full directory enumeration. Enumerates at open time via `FindFirstFileA`/`FindNextFileA`. Packs multiple entries per call with NextEntryOffset linking. Always uses info class 1 (FileDirectoryInformation, 0x40 header + ANSI filename). Returns `STATUS_NO_MORE_FILES` when exhausted.
 - [x] **NtClose:** Handle-aware — closes FILE* and frees handle slot for file handles, silently succeeds for event/thread handles.
 - [x] **Big-endian helpers:** Added `ppc_read_u16`, `ppc_write_u16`, `ppc_write_u64`.
 
 **Xbox 360 ABI Discovery:**
-- NtQueryDirectoryFile uses the full 11-parameter NT signature (r3-r10 + stack), but r10 contains a **pointer** whose first u32 is the FileInformationClass value (not the value directly). Discovered via register probing at runtime.
+- NtQueryDirectoryFile on Xbox 360 always uses FileDirectoryInformation (class 1, 0x40 header) — the r10 parameter is a FileName ANSI_STRING* filter, NOT FileInformationClass. This is unlike desktop Windows which supports multiple info classes.
 - The game opens `game:\data\` once, enumerates all 38 data files (.ib/.ibz), builds an internal file list, then enters the main render loop.
 
 **Game Data Files (38 in extracted/data/):**
@@ -275,11 +275,33 @@ VdGetSystemCommandBuffer, VdSwap
 
 ---
 
+### 2026-02-19 - File Loading & Decompression
+
+**Completed:**
+- [x] **NtQueryDirectoryFile class 1 fix:** Xbox 360 always uses FileDirectoryInformation (class 1, 0x40 header). Previously misinterpreted r10 (FileName filter pointer) as FileInformationClass, causing class 3 (0x5E header) responses. Game read filenames at wrong offset → "dirty disc" error.
+- [x] **Zlib inflate switch table:** Added 81st switch table to `vig8_switch_tables.toml` — 30-entry state machine at 0x8212DD34 (jump table at 0x82007E38, u16 relative offsets). Without this, bctr was treated as indirect call → crash.
+- [x] **Thread management restructure:** Moved PendingThread struct, globals, and `run_thread_inline()` to top of kernel_stubs.cpp. Implemented real KeResumeThread/NtResumeThread (find by handle, run inline).
+- [x] **ObReferenceObjectByHandle fix:** Now writes handle value to output pointer (needed for KeResumeThread chain to work).
+- [x] **ppc_config.h protection:** Restored custom PPC_CALL_INDIRECT_FUNC macro after XenonRecomp overwrote it. Must restore after every recompiler run.
+
+**Game Progress:**
+- Successfully enumerates all 38 data files in `game:\data\`
+- Opens and fully reads `Text_ENG.ibz` (17KB) and `menu.ibz`
+- Zlib decompression runs (inflate state machine works with new switch table)
+- Crashes after menu.ibz with corrupted function pointer `0xF5582BB1` — likely memory corruption from decompression output or pointer endianness issue
+
+**Key Technical Discoveries:**
+- Xbox 360 NtQueryDirectoryFile r10 = FileName (ANSI_STRING* filter), NOT FileInformationClass
+- XenonRecomp overwrites `ppc/ppc_config.h` on every run — custom macros must be restored
+- The game's zlib inflate uses a computed switch table XenonAnalyse couldn't detect
+
+---
+
 ## Next Steps
 
-1. Begin Xenos GPU command buffer parsing for graphics
-2. Create D3D12/Vulkan device and swap chain on the window
-3. Implement actual thread execution for ExCreateThread (game creates 3-4 threads)
+1. **Investigate crash at 0xF5582BB1** — corrupted function pointer after menu.ibz decompression. Likely memory corruption or endianness issue in decompressed data interpretation.
+2. Begin Xenos GPU command buffer parsing for graphics
+3. Create D3D12/Vulkan device and swap chain on the window
 4. Contribute instruction patches upstream to XenonRecomp
 
 ---

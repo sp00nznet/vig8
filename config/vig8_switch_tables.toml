@@ -1697,3 +1697,44 @@ labels = [
     0x8231BC68,
 ]
 
+# ---- MANUALLY ADDED: Decompression state machine (zlib inflate) ----
+# Function sub_8212D448 - switch at bctr 0x8212DD34
+# Jump table at 0x82007E38 (u16 offsets from 0x8212DD38)
+# 30 entries, index register r19
+[[switch]]
+base = 0x8212DD34
+r = 19
+default = 0x8212DD38
+labels = [
+    0x8212DD38,
+    0x8212DEB0,
+    0x8212DF4C,
+    0x8212DFD4,
+    0x8212E038,
+    0x8212E05C,
+    0x8212E114,
+    0x8212E240,
+    0x8212E2F4,
+    0x8212E3AC,
+    0x8212E3EC,
+    0x8212E418,
+    0x8212E424,
+    0x8212E4F0,
+    0x8212E558,
+    0x8212E5DC,
+    0x8212E6A8,
+    0x8212E97C,
+    0x8212EA58,
+    0x8212EC20,
+    0x8212EC88,
+    0x8212EDE8,
+    0x8212EE70,
+    0x8212EF18,
+    0x8212EF38,
+    0x8212F014,
+    0x8212F0B8,
+    0x8212F0C0,
+    0x8212F20C,
+    0x8212DD38,
+]
+

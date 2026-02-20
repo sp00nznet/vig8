@@ -14,7 +14,7 @@ Unlike emulation (which interprets instructions at runtime), static recompilatio
 
 See [PROGRESS.md](PROGRESS.md) for detailed progress tracking.
 
-**Current Phase:** Game boots, enumerates game data files, runs main loop with Win32 window (no rendering yet)
+**Current Phase:** Game loads data files (Text_ENG.ibz, menu.ibz), decompresses via zlib, investigating post-load crash
 
 | Milestone | Status |
 |-----------|--------|
@@ -32,6 +32,8 @@ See [PROGRESS.md](PROGRESS.md) for detailed progress tracking.
 | Game main loop running (Update/Render cycle) | Done |
 | Win32 window (1280x720, message pump) | Done |
 | File I/O: handle table, path translation, directory enumeration | Done |
+| Game data loading: Text_ENG.ibz, menu.ibz via zlib decompress | Done |
+| Switch table: zlib inflate state machine (81 tables total) | Done |
 | Graphics (Xenos -> D3D12/Vulkan) | Not Started |
 | Audio / Input / Integration | Not Started |
 
