@@ -11,6 +11,10 @@
 // The PE image should be extracted from the XEX using tools/dump_pe.exe:
 //   dump_pe.exe extracted/default.xex extracted/pe_image.bin
 //
+// IMPORTANT: Xex2LoadImage outputs the PE in MEMORY-MAPPED layout, meaning
+// sections are already at their virtual addresses within the file (not at
+// their RawPtr file offsets). So file_offset == RVA for all sections.
+//
 // We skip code sections (.text) since they're statically recompiled.
 // We copy data sections (.rdata, .data, .embsec_*, etc.) into the PPC
 // memory space so the recompiled code can access global variables,
@@ -72,7 +76,9 @@ bool xex_load_data_sections(uint8_t* base, const char* pe_path)
 
     printf("  Machine: 0x%04X, Sections: %u\n", machine, num_sections);
 
-    // Copy each data section into PPC memory
+    // The PE from Xex2LoadImage is in memory-mapped layout:
+    // file offsets == virtual addresses (RVAs). So we use virt_addr
+    // as the source offset into the file, not raw_offset.
     size_t total_loaded = 0;
     size_t sections_loaded = 0;
 
@@ -85,47 +91,50 @@ bool xex_load_data_sections(uint8_t* base, const char* pe_path)
         uint32_t virt_size   = *(uint32_t*)(sec_hdr + 8);
         uint32_t virt_addr   = *(uint32_t*)(sec_hdr + 12);
         uint32_t raw_size    = *(uint32_t*)(sec_hdr + 16);
-        uint32_t raw_offset  = *(uint32_t*)(sec_hdr + 20);
         uint32_t chars       = *(uint32_t*)(sec_hdr + 36);
 
         uint64_t dest_addr = PPC_MEM_IMAGE_BASE + virt_addr;
         bool is_code = (chars & 0x20) != 0;  // IMAGE_SCN_CNT_CODE
 
-        printf("  %-8s VA=0x%08llX VSize=0x%06X Raw=0x%06X %s\n",
-               name, (unsigned long long)dest_addr, virt_size, raw_size,
+        printf("  %-8s VA=0x%08llX VSize=0x%06X %s\n",
+               name, (unsigned long long)dest_addr, virt_size,
                is_code ? "(code, skip)" : "(data, load)");
 
         // Skip code sections (statically recompiled)
         if (is_code) continue;
 
-        // Skip sections with no raw data
-        if (raw_size == 0 && virt_size == 0) continue;
+        // Skip sections with no data
+        if (virt_size == 0) continue;
 
-        // Validate bounds
-        uint32_t copy_size = raw_size < virt_size ? raw_size : virt_size;
-        if (raw_offset + copy_size > pe_image.size())
-        {
-            fprintf(stderr, "    WARNING: section data extends past file end, truncating\n");
-            copy_size = (raw_offset < pe_image.size()) ? (uint32_t)(pe_image.size() - raw_offset) : 0;
-        }
-
+        // Validate destination bounds
         if (dest_addr + virt_size > PPC_MEM_IMAGE_BASE + PPC_MEM_IMAGE_SIZE)
         {
             fprintf(stderr, "    WARNING: section extends past image region, skipping\n");
             continue;
         }
 
-        // Copy section data
-        if (copy_size > 0)
+        // In memory-mapped layout, source offset = virt_addr
+        // Copy the lesser of virt_size and what's available in the file
+        uint32_t copy_size = virt_size;
+        if (virt_addr + copy_size > pe_image.size())
         {
-            memcpy(base + dest_addr, pe_image.data() + raw_offset, copy_size);
+            copy_size = (virt_addr < pe_image.size())
+                ? (uint32_t)(pe_image.size() - virt_addr) : 0;
+            if (copy_size < virt_size)
+                fprintf(stderr, "    Note: section extends past file, loading %u of %u bytes\n",
+                        copy_size, virt_size);
         }
 
-        // Zero-fill BSS portion (virt_size > raw_size)
+        // Copy section data from file at RVA offset
+        if (copy_size > 0)
+        {
+            memcpy(base + dest_addr, pe_image.data() + virt_addr, copy_size);
+        }
+
+        // Zero-fill any remaining BSS portion
         if (virt_size > copy_size)
         {
-            uint32_t zero_fill = virt_size - copy_size;
-            memset(base + dest_addr + copy_size, 0, zero_fill);
+            memset(base + dest_addr + copy_size, 0, virt_size - copy_size);
         }
 
         total_loaded += copy_size;

@@ -92,4 +92,33 @@ void ppc_populate_func_table(uint8_t* base)
     }
 
     printf("  Populated %zu function table entries\n", count);
+
+    // Register the universal dynamic stub for XexGetProcedureAddress
+    ppc_register_dynamic_stub(base, PPC_DYNAMIC_STUB_ADDR);
+}
+
+// Universal dynamic stub: called when a dynamically-resolved function pointer
+// (from XexGetProcedureAddress) is invoked. Just returns 0 (success).
+static void ppc_dynamic_stub_impl(PPCContext& __restrict ctx, uint8_t* base)
+{
+    static uint64_t call_count = 0;
+    call_count++;
+    if (call_count <= 10 || (call_count & 0xFFFF) == 0)
+    {
+        fprintf(stderr, "[DYN-STUB] Dynamic stub called (#%llu), LR=0x%08X, r3=0x%08X\n",
+                (unsigned long long)call_count, (uint32_t)ctx.lr, ctx.r3.u32);
+        fflush(stderr);
+    }
+    ctx.r3.u32 = 0; // Return success
+}
+
+void ppc_register_dynamic_stub(uint8_t* base, uint32_t ppc_addr)
+{
+    if (ppc_addr >= PPC_CODE_BASE && ppc_addr < PPC_CODE_BASE + PPC_CODE_SIZE)
+    {
+        uint64_t table_offset = PPC_FUNC_TABLE_OFFSET +
+            (static_cast<uint64_t>(ppc_addr - PPC_CODE_BASE) * 2);
+        auto* slot = reinterpret_cast<PPCFunc**>(base + table_offset);
+        *slot = ppc_dynamic_stub_impl;
+    }
 }

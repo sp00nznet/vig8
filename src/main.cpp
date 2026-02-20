@@ -5,12 +5,37 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cfenv>
+#include <xmmintrin.h>
+#include <float.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+
+static uint8_t* g_ppc_base = nullptr;
+
+// Counter for NULL indirect calls (COM vtable entries on uninitialized objects)
+uint64_t g_null_icall_count = 0;
+
+// Vectored exception handler: catch and silence FP exceptions
+static LONG WINAPI fp_exception_handler(EXCEPTION_POINTERS* ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    // Handle all floating-point exceptions by masking them and continuing
+    if (code >= 0xC000008D && code <= 0xC0000093) // FLT_DENORMAL through FLT_UNDERFLOW
+    {
+        // Clear the x87 FPU status and re-mask exceptions
+        _clearfp();
+        _controlfp(_MCW_EM, _MCW_EM);
+        // Also reset MXCSR
+        _mm_setcsr(0x1F80);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 static LONG WINAPI crash_handler(EXCEPTION_POINTERS* ep)
 {
@@ -19,9 +44,21 @@ static LONG WINAPI crash_handler(EXCEPTION_POINTERS* ep)
             ep->ExceptionRecord->ExceptionAddress);
     if (ep->ExceptionRecord->ExceptionCode == 0xC0000005)
     {
-        fprintf(stderr, "[CRASH] Access violation: %s address %p\n",
+        auto fault_addr = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+        fprintf(stderr, "[CRASH] Access violation: %s address 0x%llX\n",
                 ep->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
-                (void*)ep->ExceptionRecord->ExceptionInformation[1]);
+                (unsigned long long)fault_addr);
+        if (g_ppc_base)
+        {
+            auto base_addr = (uintptr_t)g_ppc_base;
+            int64_t offset = (int64_t)(fault_addr - base_addr);
+            fprintf(stderr, "[CRASH] PPC base = 0x%llX, offset = 0x%llX (%lld)\n",
+                    (unsigned long long)base_addr, (unsigned long long)offset, (long long)offset);
+            if (offset >= 0 && offset < 0x100000000LL)
+                fprintf(stderr, "[CRASH] PPC address = 0x%08X\n", (uint32_t)offset);
+            else
+                fprintf(stderr, "[CRASH] PPC address = OUT OF RANGE (negative or > 4GB)\n");
+        }
     }
     fflush(stderr);
     return EXCEPTION_EXECUTE_HANDLER;
@@ -34,6 +71,7 @@ PPC_EXTERN_FUNC(_xstart);
 int main(int argc, char* argv[])
 {
 #ifdef _WIN32
+    AddVectoredExceptionHandler(1, fp_exception_handler);
     SetUnhandledExceptionFilter(crash_handler);
 #endif
     printf("=== Vigilante 8 Arcade - Static Recompilation ===\n\n");
@@ -46,6 +84,7 @@ int main(int argc, char* argv[])
     // Step 1: Allocate PPC memory space (4 GB committed)
     printf("[1/4] Allocating PPC memory space...\n");
     uint8_t* base = ppc_memory_alloc();
+    g_ppc_base = base;
     if (!base)
     {
         fprintf(stderr, "FATAL: Failed to allocate PPC memory\n");
@@ -68,23 +107,56 @@ int main(int argc, char* argv[])
     PPCContext ctx{};
     memset(&ctx, 0, sizeof(ctx));
 
+    // CRITICAL: Initialize FPSCR's cached MXCSR to 0x1F80 (all exceptions masked).
+    // The generated code calls ctx.fpscr.setcsr(csr) which writes the cached value
+    // to MXCSR. If csr=0, this unmasks all SSE exceptions, causing every FP operation
+    // to trigger a hardware exception (making execution ~1000x slower).
+    ctx.fpscr.csr = 0x1F80;
+
     // Set up stack pointer (r1) - stack grows downward from PPC_STACK_BASE
     // Leave 16 bytes of headroom at the top for the stack frame header
     ctx.r1.u32 = PPC_STACK_BASE - 16;
 
-    // r2 = Table of Contents (TOC) pointer
-    // TODO: Extract from XEX header or find via analysis
-    // For now, leave as 0 - will need to be set correctly for global data access
+    // r2 is NOT used as a TOC pointer in this binary (analysis confirmed all
+    // TOC-style r2 accesses are dead code in switch table data). r2 is used
+    // only as a scratch register. Leave at 0.
     ctx.r2.u32 = 0;
 
-    // r13 = Small Data Area (SDA) base
-    // TODO: Extract from XEX or determine via analysis
-    ctx.r13.u32 = 0;
+    // r13 = KPCR (Kernel Processor Control Region) pointer on Xbox 360.
+    // The game code accesses:
+    //   r13+0x100 = pointer to current KTHREAD
+    //   r13+0x10C = per-processor flag byte
+    //   r13+0x150 = error suppression flag
+    ctx.r13.u32 = PPC_KPCR_BASE;
+
+    // Set up fake KPCR structure
+    // KPCR+0x100: pointer to current KTHREAD
+    PPC_STORE_U32(PPC_KPCR_BASE + 0x100, PPC_KTHREAD_BASE);
+    // KPCR+0x10C: per-processor flag byte (0 = normal)
+    PPC_STORE_U32(PPC_KPCR_BASE + 0x10C, 0);
+    // KPCR+0x150: error suppression flag (0 = not suppressed)
+    PPC_STORE_U32(PPC_KPCR_BASE + 0x150, 0);
+
+    // KTHREAD+0x160: last error code (0 = no error)
+    PPC_STORE_U32(PPC_KTHREAD_BASE + 0x160, 0);
 
     printf("  r1  (SP)    = 0x%08X\n", ctx.r1.u32);
-    printf("  r2  (TOC)   = 0x%08X\n", ctx.r2.u32);
-    printf("  r13 (SDA)   = 0x%08X\n", ctx.r13.u32);
+    printf("  r13 (KPCR)  = 0x%08X\n", ctx.r13.u32);
+    printf("  KTHREAD     = 0x%08X\n", PPC_KTHREAD_BASE);
     printf("  Entry point = 0x%08X (_xstart)\n\n", PPC_ENTRY_POINT);
+
+    // Mask all floating-point exceptions. The recompiled PPC code may trigger
+    // FP inexact/overflow/underflow which are normally masked on Xbox 360.
+    // Set both x87 FPU and SSE/AVX (MXCSR) exception masks.
+    {
+        // x87 FPU: mask all exceptions
+        _controlfp(_MCW_EM, _MCW_EM);
+        // SSE/AVX: set MXCSR to mask all exceptions (bits 7-12 = exception masks)
+        // Default MXCSR = 0x1F80 (all masked). Force it.
+        unsigned int mxcsr = 0x1F80; // all exceptions masked, round to nearest
+        _mm_setcsr(mxcsr);
+        printf("  FP exceptions masked (x87 + SSE/MXCSR=0x%04X)\n", mxcsr);
+    }
 
     printf("=== Launching _xstart ===\n");
     fflush(stdout);

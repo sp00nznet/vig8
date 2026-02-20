@@ -14,7 +14,7 @@ Unlike emulation (which interprets instructions at runtime), static recompilatio
 
 See [PROGRESS.md](PROGRESS.md) for detailed progress tracking.
 
-**Current Phase:** Runtime skeleton functional, CRT initialization in progress
+**Current Phase:** Game boots and runs main loop (headless, no graphics yet)
 
 | Milestone | Status |
 |-----------|--------|
@@ -28,7 +28,8 @@ See [PROGRESS.md](PROGRESS.md) for detailed progress tracking.
 | PE extraction & data section loading | Done |
 | Xbox 360 kernel import stubs (205 functions) | Done |
 | Successful build & link (19.7 MB native exe) | Done |
-| CRT initialization & game boot | In Progress |
+| CRT initialization & game boot | Done |
+| Game main loop running (Update/Render cycle) | Done |
 | Graphics (Xenos -> D3D12/Vulkan) | Not Started |
 | Audio / Input / Integration | Not Started |
 

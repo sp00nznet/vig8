@@ -1,5 +1,6 @@
 #include "ppc_config.h"
 #include "ppc_context.h"
+#include "memory.h"
 
 #include <cstdio>
 #include <cstdarg>
@@ -13,6 +14,7 @@
 #include <windows.h>
 #else
 #include <chrono>
+#include <thread>
 #endif
 
 // ============================================================================
@@ -36,10 +38,18 @@
 #define STUB_LOG_ENABLED 1
 #endif
 
+// Verbose mode: log every call, not just first
+#ifndef STUB_VERBOSE
+#define STUB_VERBOSE 0
+#endif
+
 #if STUB_LOG_ENABLED
 #define STUB_LOG(name) \
     fprintf(stderr, "[STUB] %s(r3=0x%08X, r4=0x%08X, r5=0x%08X, r6=0x%08X)\n", \
             name, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32)
+#if STUB_VERBOSE
+#define STUB_LOG_ONCE(name) STUB_LOG(name)
+#else
 #define STUB_LOG_ONCE(name) do { \
     static bool logged = false; \
     if (!logged) { \
@@ -47,10 +57,22 @@
         logged = true; \
     } \
 } while(0)
+#endif
 #else
 #define STUB_LOG(name)
 #define STUB_LOG_ONCE(name)
 #endif
+
+// Heartbeat: track total stub calls to show the game is alive
+static uint64_t g_stub_call_count = 0;
+static uint64_t g_last_heartbeat = 0;
+#define STUB_HEARTBEAT() do { \
+    g_stub_call_count++; \
+    if (g_stub_call_count - g_last_heartbeat >= 10000) { \
+        fprintf(stderr, "[HEARTBEAT] %llu stub calls\n", (unsigned long long)g_stub_call_count); \
+        g_last_heartbeat = g_stub_call_count; \
+    } \
+} while(0)
 
 // Helper: read a big-endian uint32 from PPC memory
 static inline uint32_t ppc_read_u32(uint8_t* base, uint32_t addr)
@@ -282,6 +304,7 @@ PPC_FUNC(__imp__KeResetEvent)
 PPC_FUNC(__imp__KeWaitForSingleObject)
 {
     STUB_LOG_ONCE("KeWaitForSingleObject");
+    STUB_HEARTBEAT();
     ctx.r3.u32 = 0; // STATUS_WAIT_0
 }
 
@@ -397,6 +420,7 @@ PPC_FUNC(__imp__RtlInitializeCriticalSectionAndSpinCount)
 
 PPC_FUNC(__imp__RtlEnterCriticalSection)
 {
+    STUB_HEARTBEAT();
     // No-op in single-threaded mode
     ctx.r3.u32 = 0;
 }
@@ -976,14 +1000,20 @@ PPC_FUNC(__imp__VdGetCurrentDisplayGamma)
 PPC_FUNC(__imp__VdGetSystemCommandBuffer)
 {
     // r3 = command_buffer* (out), r4 = buffer_size* (out)
-    STUB_LOG("VdGetSystemCommandBuffer");
-    // Allocate a small command buffer
-    uint32_t cmd_size = 0x10000; // 64KB
-    uint32_t cmd_buf = g_heap_next;
-    g_heap_next += cmd_size;
-    memset(base + cmd_buf, 0, cmd_size);
-    ppc_write_u32(base, ctx.r3.u32, cmd_buf);
-    ppc_write_u32(base, ctx.r4.u32, cmd_size);
+    STUB_LOG_ONCE("VdGetSystemCommandBuffer");
+    // Allocate a command buffer on first call, reuse on subsequent calls
+    static uint32_t s_cmd_buf = 0;
+    static uint32_t s_cmd_size = 0x10000; // 64KB
+    if (!s_cmd_buf)
+    {
+        s_cmd_buf = g_heap_next;
+        g_heap_next += s_cmd_size;
+        memset(base + s_cmd_buf, 0, s_cmd_size);
+        fprintf(stderr, "[MEM] VdGetSystemCommandBuffer: allocated 0x%08X (%u bytes)\n",
+                s_cmd_buf, s_cmd_size);
+    }
+    ppc_write_u32(base, ctx.r3.u32, s_cmd_buf);
+    ppc_write_u32(base, ctx.r4.u32, s_cmd_size);
 }
 
 PPC_FUNC(__imp__VdInitializeRingBuffer)
@@ -1025,8 +1055,14 @@ PPC_FUNC(__imp__VdPersistDisplay)
 
 PPC_FUNC(__imp__VdSwap)
 {
-    // Frame swap - this is where we'd present the frame
+    // Frame swap - this is where we'd present the frame.
+    // Sleep to prevent 100% CPU usage since we have no real GPU work.
     STUB_LOG_ONCE("VdSwap");
+#ifdef _WIN32
+    Sleep(16); // ~60 FPS cap
+#else
+    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+#endif
 }
 
 PPC_FUNC(__imp__VdEnableDisableClockGating)
@@ -1683,8 +1719,13 @@ PPC_FUNC(__imp__XexGetProcedureAddress)
 {
     // r3 = module handle, r4 = ordinal, r5 = proc address* (out)
     STUB_LOG("XexGetProcedureAddress");
-    fprintf(stderr, "  Handle=0x%08X, Ordinal=%u\n", ctx.r3.u32, ctx.r4.u32);
-    ctx.r3.u32 = 0x80070057; // Not found
+    uint32_t ordinal = ctx.r4.u32;
+    uint32_t out_ptr = ctx.r5.u32;
+    fprintf(stderr, "  Handle=0x%08X, Ordinal=%u\n", ctx.r3.u32, ordinal);
+    // Write a dynamic stub address so the game can call through the pointer
+    if (out_ptr)
+        ppc_write_u32(base, out_ptr, PPC_DYNAMIC_STUB_ADDR);
+    ctx.r3.u32 = 0; // Success
 }
 
 PPC_FUNC(__imp__XexCheckExecutablePrivilege)
