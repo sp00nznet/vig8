@@ -20,6 +20,24 @@ static uint8_t* g_ppc_base = nullptr;
 // Counter for NULL indirect calls (COM vtable entries on uninitialized objects)
 uint64_t g_null_icall_count = 0;
 
+// Global window handle
+HWND g_hwnd = nullptr;
+
+// Window procedure
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg)
+    {
+    case WM_CLOSE:
+        PostQuitMessage(0);
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
 // Vectored exception handler: catch and silence FP exceptions
 static LONG WINAPI fp_exception_handler(EXCEPTION_POINTERS* ep)
 {
@@ -99,11 +117,46 @@ int main(int argc, char* argv[])
     }
 
     // Step 3: Populate function lookup table
-    printf("\n[3/4] Building function lookup table...\n");
+    printf("\n[3/5] Building function lookup table...\n");
     ppc_populate_func_table(base);
 
-    // Step 4: Initialize PPC context and launch
-    printf("\n[4/4] Initializing PPC context...\n");
+    // Step 4: Create Win32 window
+    printf("\n[4/5] Creating window...\n");
+    {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = WndProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+        wc.lpszClassName = L"Vig8WndClass";
+        RegisterClassExW(&wc);
+
+        RECT rc = {0, 0, 1280, 720};
+        AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+
+        g_hwnd = CreateWindowExW(
+            0, L"Vig8WndClass", L"Vigilante 8 Arcade",
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT, CW_USEDEFAULT,
+            rc.right - rc.left, rc.bottom - rc.top,
+            nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+
+        if (!g_hwnd)
+        {
+            fprintf(stderr, "FATAL: Failed to create window (error %lu)\n", GetLastError());
+            ppc_memory_free(base);
+            return 1;
+        }
+
+        ShowWindow(g_hwnd, SW_SHOW);
+        UpdateWindow(g_hwnd);
+        printf("  Window created: 1280x720\n");
+    }
+
+    // Step 5: Initialize PPC context and launch
+    printf("\n[5/5] Initializing PPC context...\n");
     PPCContext ctx{};
     memset(&ctx, 0, sizeof(ctx));
 

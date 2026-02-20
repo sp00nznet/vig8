@@ -73,6 +73,10 @@ target_include_directories(vig8 PRIVATE
 
 target_link_libraries(vig8 PRIVATE ppc_recomp)
 
+if(WIN32)
+    target_link_libraries(vig8 PRIVATE user32 gdi32)
+endif()
+
 target_compile_options(vig8 PRIVATE
     -Wall
     -O2

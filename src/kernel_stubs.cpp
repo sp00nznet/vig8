@@ -1056,9 +1056,17 @@ PPC_FUNC(__imp__VdPersistDisplay)
 PPC_FUNC(__imp__VdSwap)
 {
     // Frame swap - this is where we'd present the frame.
-    // Sleep to prevent 100% CPU usage since we have no real GPU work.
+    // Pump Win32 messages and sleep to prevent 100% CPU usage.
     STUB_LOG_ONCE("VdSwap");
 #ifdef _WIN32
+    MSG msg;
+    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+    {
+        if (msg.message == WM_QUIT)
+            ExitProcess(0);
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
     Sleep(16); // ~60 FPS cap
 #else
     std::this_thread::sleep_for(std::chrono::milliseconds(16));

@@ -55,3 +55,9 @@ void ppc_register_dynamic_stub(uint8_t* base, uint32_t ppc_addr);
 // Must be within PPC_MEM_CODE_BASE..PPC_MEM_CODE_BASE+PPC_MEM_CODE_SIZE.
 // Using last aligned address in code range.
 constexpr uint32_t PPC_DYNAMIC_STUB_ADDR = 0x8238D8F0;
+
+// Global window handle (created in main.cpp, used by kernel_stubs.cpp)
+#ifdef _WIN32
+#include <windows.h>
+extern HWND g_hwnd;
+#endif

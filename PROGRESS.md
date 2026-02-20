@@ -11,6 +11,7 @@
 | 4b. Instruction Support | Add 30+ missing Altivec/VMX to XenonRecomp | DONE |
 | 5. Runtime Skeleton | Minimal runtime to link & boot | DONE |
 | 5b. Game Boot | Fix CRT init, get game loop running | DONE |
+| 5c. Window | Win32 window with message pump | DONE |
 | 6. Graphics | Xenos -> D3D12/Vulkan rendering | NOT STARTED |
 | 7. Audio | Audio system implementation | NOT STARTED |
 | 8. Input | Controller/keyboard input | NOT STARTED |
@@ -224,10 +225,30 @@ XamNotifyCreateListener, NtOpenFile (x3), VdGetSystemCommandBuffer, VdSwap
 
 ---
 
+### 2026-02-19 - Win32 Window Creation
+
+**Completed:**
+- [x] Created 1280x720 Win32 window ("Vigilante 8 Arcade") in `main.cpp`
+- [x] Window creation happens after function table setup, before PPC context init
+- [x] `WndProc` handles `WM_CLOSE`/`WM_DESTROY` → `PostQuitMessage(0)`
+- [x] `VdSwap` stub now pumps Win32 messages (`PeekMessage`/`TranslateMessage`/`DispatchMessage`)
+- [x] `WM_QUIT` in message pump → `ExitProcess(0)` for clean shutdown
+- [x] `g_hwnd` global declared in `memory.h`, defined in `main.cpp`
+- [x] CMakeLists.txt links `user32`/`gdi32` explicitly
+- [x] Black background brush (window starts black, ready for future D3D surface)
+
+**What This Enables:**
+- Visible window for future D3D rendering surface
+- Proper process lifecycle (close window = exit)
+- Responsive window (draggable, resizable, closable)
+- Console output still shows normal boot sequence
+
+---
+
 ## Next Steps
 
-1. Implement basic D3D window creation (show a window instead of headless)
-2. Begin Xenos GPU command buffer parsing for graphics
+1. Begin Xenos GPU command buffer parsing for graphics
+2. Create D3D12/Vulkan device and swap chain on the window
 3. Implement actual thread execution for ExCreateThread (game creates 3-4 threads)
 4. Implement basic file I/O (for game data loading from extracted/ directory)
 5. Contribute instruction patches upstream to XenonRecomp

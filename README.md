@@ -14,7 +14,7 @@ Unlike emulation (which interprets instructions at runtime), static recompilatio
 
 See [PROGRESS.md](PROGRESS.md) for detailed progress tracking.
 
-**Current Phase:** Game boots and runs main loop (headless, no graphics yet)
+**Current Phase:** Game boots and runs main loop with Win32 window (no rendering yet)
 
 | Milestone | Status |
 |-----------|--------|
@@ -30,6 +30,7 @@ See [PROGRESS.md](PROGRESS.md) for detailed progress tracking.
 | Successful build & link (19.7 MB native exe) | Done |
 | CRT initialization & game boot | Done |
 | Game main loop running (Update/Render cycle) | Done |
+| Win32 window (1280x720, message pump) | Done |
 | Graphics (Xenos -> D3D12/Vulkan) | Not Started |
 | Audio / Input / Integration | Not Started |
 
