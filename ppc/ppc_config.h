@@ -28,11 +28,16 @@ extern uint64_t g_null_icall_count;
         break; \
     } \
     if (_target < (uint32_t)PPC_CODE_BASE || _target >= (uint32_t)(PPC_CODE_BASE + PPC_CODE_SIZE)) { \
-        fprintf(stderr, "[FATAL] Indirect call to 0x%08X outside code [0x%08X-0x%08X)\n", \
-                _target, (uint32_t)PPC_CODE_BASE, (uint32_t)(PPC_CODE_BASE + PPC_CODE_SIZE)); \
-        fprintf(stderr, "  LR=0x%08X, CTR=0x%08X, r1=0x%08X, r3=0x%08X\n", \
-                (uint32_t)ctx.lr, ctx.ctr.u32, ctx.r1.u32, ctx.r3.u32); \
-        fflush(stderr); abort(); \
+        static int _oor_count = 0; \
+        if (++_oor_count <= 20) { \
+            fprintf(stderr, "[WARN] Indirect call to 0x%08X outside code [0x%08X-0x%08X) — skipping\n", \
+                    _target, (uint32_t)PPC_CODE_BASE, (uint32_t)(PPC_CODE_BASE + PPC_CODE_SIZE)); \
+            fprintf(stderr, "  LR=0x%08X, CTR=0x%08X, r1=0x%08X, r3=0x%08X\n", \
+                    (uint32_t)ctx.lr, ctx.ctr.u32, ctx.r1.u32, ctx.r3.u32); \
+            fflush(stderr); \
+        } \
+        ctx.r3.u32 = 0; \
+        break; \
     } \
     PPCFunc* _fn = PPC_LOOKUP_FUNC(base, _target); \
     if (!_fn) { \

@@ -13,6 +13,8 @@
 | 5b. Game Boot | Fix CRT init, get game loop running | DONE |
 | 5c. Window | Win32 window with message pump | DONE |
 | 5d. File I/O | Handle table, path translation, directory enumeration | DONE |
+| 5e. Threading | Fiber-based cooperative threading (ExCreateThread, yield) | DONE |
+| 5f. GPU Init | Ring buffer, EDRAM, render threads, XConfig | DONE |
 | 6. Graphics | Xenos -> D3D12/Vulkan rendering | NOT STARTED |
 | 7. Audio | Audio system implementation | NOT STARTED |
 | 8. Input | Controller/keyboard input | NOT STARTED |
@@ -297,12 +299,62 @@ VdGetSystemCommandBuffer, VdSwap
 
 ---
 
+### 2026-02-20 - NetDll Fix, Fiber Threading & GPU Init
+
+**Completed:**
+- [x] **ROOT CAUSE: Crash at 0xF5582BB1 was NetDll_XNetRandom corrupting .rdata**
+  - Xbox 360 NetDll functions take an xnet handle in r3, shifting all other params by 1
+  - Old code: `buf = r3` (handle), `len = r4` (buffer ptr) — wrote random bytes at handle address
+  - Fix: `buf = r4`, `len = r5` — correct Xbox 360 NetDll calling convention
+  - Memory watchpoint system traced corruption to NetDll_XNetRandom call
+- [x] **Fiber-based cooperative threading** replacing single-threaded model
+  - `ConvertThreadToFiber` in main.cpp converts main thread to fiber
+  - `PendingThread` struct extended: fiber handle, own PPCContext, PPC stack (256KB each)
+  - `ppc_thread_fiber_proc()`: fiber entry point for PPC threads
+  - `init_thread_ctx()`: initializes thread's PPCContext (r13, fpscr, stack, context arg)
+  - `thread_give_timeslice()`: creates fiber if needed, switches via `SwitchToFiber`
+  - `thread_yield()`: called from blocking stubs, switches back to `g_main_fiber`
+  - KeDelayExecutionThread, KeWaitForSingleObject yield from fiber threads
+  - NtResumeThread gives immediate timeslice to resumed threads
+  - ExCreateThread gives immediate timeslice to non-suspended threads
+  - VdSwap gives each ready thread a timeslice per frame
+- [x] **Non-fatal indirect calls:** PPC_CALL_INDIRECT_FUNC changed from fatal abort to warning+skip for out-of-range targets (logs first 20, then silently returns r3=0)
+- [x] **ExGetXConfigSetting real values:**
+  - Category 3, Setting 9: AV_REGION = 0x1000 (NTSC-U)
+  - Category 3, Setting 10: GAME_REGION = 0xFF (all regions)
+  - This fixed the game taking a completely different (and correct) initialization path
+- [x] **GPU initialization now working:**
+  - VdInitializeEngines, VdSetGraphicsInterruptCallback
+  - MmAllocatePhysicalMemoryEx (64MB GPU, ring buffer, EDRAM)
+  - VdInitializeRingBuffer, VdEnableRingBufferRPtrWriteBack
+  - VdQueryVideoMode, VdRetrainEDRAM, VdCallGraphicsNotificationRoutines
+  - GPU render threads 3 & 4 (routine 0x821517E8) created and running
+- [x] **Full rebuild of all 49 PPC source files** after ppc_config.h macro change
+
+**Game Progress:**
+- Boots through full initialization (CRT, heap, constructors, game init)
+- GPU subsystem initializes (ring buffer, EDRAM, video mode, render threads)
+- Loads Text_ENG.ibz (17KB) and menu.ibz (2.4MB) with zlib decompression
+- Creates 6 threads (0-5): 3 game threads, 2 GPU render threads, 1 game logic thread
+- Queries input for 4 controllers (all return ERROR_DEVICE_NOT_CONNECTED)
+- Queries ExGetXConfigSetting for AV_REGION and GAME_REGION
+- Currently stalls after input initialization in pure PPC code (likely GPU command buffer polling)
+
+**Key Technical Discoveries:**
+- Xbox 360 NetDll calling convention: r3 = xnet handle (ignored), r4+ = actual params
+- ExGetXConfigSetting AV_REGION response changes the entire game initialization flow
+- Non-suspended threads need immediate fiber timeslices (can't wait for VdSwap)
+- GPU render threads wait on events (KeWaitForSingleObject) for work signaling
+
+---
+
 ## Next Steps
 
-1. **Investigate crash at 0xF5582BB1** — corrupted function pointer after menu.ibz decompression. Likely memory corruption or endianness issue in decompressed data interpretation.
-2. Begin Xenos GPU command buffer parsing for graphics
-3. Create D3D12/Vulkan device and swap chain on the window
-4. Contribute instruction patches upstream to XenonRecomp
+1. **Debug main thread stall** — game enters pure PPC code loop after input init, likely polling GPU ring buffer read pointer or waiting for render thread synchronization
+2. Implement GPU ring buffer read-pointer writeback (instant GPU command "processing")
+3. Begin Xenos GPU command buffer parsing for graphics
+4. Create D3D12/Vulkan device and swap chain on the window
+5. Contribute instruction patches upstream to XenonRecomp
 
 ---
 

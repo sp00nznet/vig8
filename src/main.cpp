@@ -92,6 +92,9 @@ int main(int argc, char* argv[])
     AddVectoredExceptionHandler(1, fp_exception_handler);
     SetUnhandledExceptionFilter(crash_handler);
 #endif
+    // Force line-buffered stderr so crash messages aren't lost
+    setvbuf(stderr, nullptr, _IONBF, 0);
+    setvbuf(stdout, nullptr, _IONBF, 0);
     printf("=== Vigilante 8 Arcade - Static Recompilation ===\n\n");
 
     // Default PE image path (extracted from XEX using tools/dump_pe.exe)
@@ -209,6 +212,19 @@ int main(int argc, char* argv[])
         unsigned int mxcsr = 0x1F80; // all exceptions masked, round to nearest
         _mm_setcsr(mxcsr);
         printf("  FP exceptions masked (x87 + SSE/MXCSR=0x%04X)\n", mxcsr);
+    }
+
+    // Convert main thread to fiber for cooperative threading with PPC threads
+    extern LPVOID g_main_fiber;
+    g_main_fiber = ConvertThreadToFiber(nullptr);
+    if (!g_main_fiber)
+    {
+        fprintf(stderr, "WARNING: ConvertThreadToFiber failed (error %lu), threads will not work\n",
+                GetLastError());
+    }
+    else
+    {
+        printf("  Main thread converted to fiber\n");
     }
 
     printf("=== Launching _xstart ===\n");

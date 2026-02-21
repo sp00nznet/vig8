@@ -42,7 +42,7 @@
 
 // Verbose mode: log every call, not just first
 #ifndef STUB_VERBOSE
-#define STUB_VERBOSE 0
+#define STUB_VERBOSE 1
 #endif
 
 #if STUB_LOG_ENABLED
@@ -115,10 +115,10 @@ static inline void ppc_write_u64(uint8_t* base, uint32_t addr, uint64_t val)
 }
 
 // ============================================================================
-// Thread management (single-threaded model)
+// Thread management (cooperative fiber-based model)
 // ============================================================================
 
-// Queued thread start routines for single-threaded execution
+// PPC thread state — each thread has its own PPCContext and PPC stack
 struct PendingThread
 {
     uint32_t handle;        // handle assigned to this thread
@@ -126,45 +126,108 @@ struct PendingThread
     uint32_t start_context; // PPC address passed as r3
     uint32_t api_startup;   // PPC address of ApiThreadStartup wrapper
     bool     suspended;     // created in suspended state
-    bool     ran;           // already executed
+    bool     finished;      // thread function has returned
+    bool     started;       // fiber has been created and started
+    uint32_t ppc_stack_top; // PPC stack address for this thread
+    LPVOID   fiber;         // Windows fiber handle
+    PPCContext thread_ctx;  // thread's own PPC register state
+    uint8_t* base;          // shared PPC memory base
 };
 
 static constexpr int MAX_PENDING_THREADS = 16;
 static PendingThread g_pending_threads[MAX_PENDING_THREADS] = {};
 static int g_pending_thread_count = 0;
 
-// Run a pending thread inline (single-threaded model)
-static void run_thread_inline(PendingThread& pt, int idx, PPCContext& __restrict ctx, uint8_t* base)
-{
-    if (pt.ran || !pt.start_routine) return;
-    pt.ran = true;
+// Fiber globals
+LPVOID g_main_fiber = nullptr;                 // main thread's fiber (set in main.cpp)
+static PendingThread* g_current_thread = nullptr; // currently running PPC thread (NULL = main)
+static int g_current_thread_idx = -1;
 
-    uint32_t func_addr = pt.start_routine;
-    if (func_addr >= PPC_MEM_CODE_BASE &&
-        func_addr < PPC_MEM_CODE_BASE + PPC_MEM_CODE_SIZE)
+// Allocate a PPC stack for a child thread (from the heap region)
+static uint32_t g_thread_stack_next = 0x8E000000; // separate region for thread stacks
+static constexpr uint32_t THREAD_STACK_SIZE = 256 * 1024; // 256 KB per thread
+
+static uint32_t alloc_thread_stack()
+{
+    uint32_t top = g_thread_stack_next;
+    g_thread_stack_next -= THREAD_STACK_SIZE;
+    return top;
+}
+
+// Fiber entry point for PPC threads
+static void CALLBACK ppc_thread_fiber_proc(LPVOID param)
+{
+    PendingThread* pt = (PendingThread*)param;
+    PPCContext& ctx = pt->thread_ctx;
+    uint8_t* base = pt->base;
+    int idx = (int)(pt - g_pending_threads);
+
+    uint32_t func_addr = pt->start_routine;
+    typedef void (*PPCFuncPtr)(PPCContext& __restrict, uint8_t*);
+    PPCFuncPtr fn = PPC_LOOKUP_FUNC(base, func_addr);
+    if (fn)
     {
-        typedef void (*PPCFuncPtr)(PPCContext& __restrict, uint8_t*);
-        PPCFuncPtr fn = PPC_LOOKUP_FUNC(base, func_addr);
-        if (fn)
-        {
-            fprintf(stderr, "[THREAD] Running thread %d (handle=0x%X): routine=0x%08X, context=0x%08X\n",
-                    idx, pt.handle, func_addr, pt.start_context);
-            uint32_t saved_r3 = ctx.r3.u32;
-            uint32_t saved_lr = ctx.lr;
-            ctx.r3.u32 = pt.start_context;
-            fn(ctx, base);
-            ctx.r3.u32 = saved_r3;
-            ctx.lr = saved_lr;
-            fprintf(stderr, "[THREAD] Thread %d returned\n", idx);
-        }
-        else
-        {
-            fprintf(stderr, "[THREAD] Thread %d: no function at 0x%08X\n", idx, func_addr);
-        }
+        fprintf(stderr, "[THREAD] Fiber %d starting: routine=0x%08X, context=0x%08X, r1=0x%08X\n",
+                idx, func_addr, pt->start_context, ctx.r1.u32);
+        fn(ctx, base);
+        fprintf(stderr, "[THREAD] Fiber %d returned normally\n", idx);
     }
     else
     {
-        fprintf(stderr, "[THREAD] Thread %d: routine 0x%08X outside code range\n", idx, func_addr);
+        fprintf(stderr, "[THREAD] Fiber %d: no function at 0x%08X\n", idx, func_addr);
+    }
+
+    pt->finished = true;
+    // Switch back to main fiber (thread is done)
+    SwitchToFiber(g_main_fiber);
+}
+
+// Initialize a thread's PPCContext from the main context template
+static void init_thread_ctx(PendingThread& pt, PPCContext& main_ctx)
+{
+    memset(&pt.thread_ctx, 0, sizeof(PPCContext));
+    // Copy key registers from main context
+    pt.thread_ctx.r13 = main_ctx.r13;   // KPCR pointer
+    pt.thread_ctx.r2 = main_ctx.r2;     // TOC (unused but copy anyway)
+    pt.thread_ctx.fpscr.csr = 0x1F80;   // mask FP exceptions
+    // Set thread-specific registers
+    pt.thread_ctx.r1.u32 = pt.ppc_stack_top - 16; // stack pointer with headroom
+    pt.thread_ctx.r3.u32 = pt.start_context;       // first argument
+}
+
+// Give a thread a time slice by switching to its fiber
+static void thread_give_timeslice(PendingThread& pt, int idx)
+{
+    if (pt.finished || pt.suspended) return;
+
+    if (!pt.started)
+    {
+        // First run: create the fiber (context already initialized in ExCreateThread)
+        pt.fiber = CreateFiber(0, ppc_thread_fiber_proc, &pt);
+        if (!pt.fiber)
+        {
+            fprintf(stderr, "[THREAD] Failed to create fiber for thread %d\n", idx);
+            pt.finished = true;
+            return;
+        }
+        pt.started = true;
+        fprintf(stderr, "[THREAD] Created fiber for thread %d (handle=0x%X, stack=0x%08X)\n",
+                idx, pt.handle, pt.ppc_stack_top);
+    }
+
+    g_current_thread = &pt;
+    g_current_thread_idx = idx;
+    SwitchToFiber(pt.fiber);
+    g_current_thread = nullptr;
+    g_current_thread_idx = -1;
+}
+
+// Called from yield stubs (KeDelayExecutionThread, etc.) to return to main
+static void thread_yield()
+{
+    if (g_current_thread && g_main_fiber)
+    {
+        SwitchToFiber(g_main_fiber);
     }
 }
 
@@ -317,6 +380,18 @@ PPC_FUNC(__imp__KeDelayExecutionThread)
 {
     // r3 = processor mode, r4 = alertable, r5 = interval (ptr to LARGE_INTEGER, 100ns units)
     STUB_LOG_ONCE("KeDelayExecutionThread");
+
+    // If we're running in a fiber thread, yield back to main
+    if (g_current_thread)
+    {
+        fprintf(stderr, "[THREAD] Fiber %d yielding via KeDelayExecutionThread\n", g_current_thread_idx);
+        thread_yield();
+        fprintf(stderr, "[THREAD] Fiber %d resumed from KeDelayExecutionThread\n", g_current_thread_idx);
+        ctx.r3.u32 = 0;
+        return;
+    }
+
+    // Main thread: actually sleep
     uint32_t interval_addr = ctx.r5.u32;
     int64_t interval = 0;
     if (interval_addr)
@@ -325,7 +400,6 @@ PPC_FUNC(__imp__KeDelayExecutionThread)
         uint32_t lo = ppc_read_u32(base, interval_addr + 4);
         interval = (int64_t(hi) << 32) | lo;
     }
-    // Negative = relative time in 100ns units
     if (interval < 0)
     {
         int ms = (int)(-interval / 10000);
@@ -365,11 +439,12 @@ PPC_FUNC(__imp__KeResumeThread)
     for (int i = 0; i < g_pending_thread_count; i++)
     {
         PendingThread& pt = g_pending_threads[i];
-        if (pt.handle == thread_ref && pt.suspended && !pt.ran)
+        if (pt.handle == thread_ref && pt.suspended && !pt.finished)
         {
-            fprintf(stderr, "[THREAD] Resuming suspended thread %d (handle=0x%X)\n", i, pt.handle);
+            fprintf(stderr, "[THREAD] Resuming thread %d (handle=0x%X) via KeResumeThread — giving timeslice\n", i, pt.handle);
             pt.suspended = false;
-            run_thread_inline(pt, i, ctx, base);
+            if (g_main_fiber)
+                thread_give_timeslice(pt, i);
             ctx.r3.u32 = 1; // previous suspend count
             return;
         }
@@ -397,12 +472,14 @@ PPC_FUNC(__imp__KeWaitForSingleObject)
 {
     STUB_LOG_ONCE("KeWaitForSingleObject");
     STUB_HEARTBEAT();
+    if (g_current_thread) thread_yield();
     ctx.r3.u32 = 0; // STATUS_WAIT_0
 }
 
 PPC_FUNC(__imp__KeWaitForMultipleObjects)
 {
     STUB_LOG_ONCE("KeWaitForMultipleObjects");
+    if (g_current_thread) thread_yield();
     ctx.r3.u32 = 0; // STATUS_WAIT_0
 }
 
@@ -414,6 +491,7 @@ PPC_FUNC(__imp__KeInitializeSemaphore)
 PPC_FUNC(__imp__KeReleaseSemaphore)
 {
     STUB_LOG_ONCE("KeReleaseSemaphore");
+    if (g_current_thread) thread_yield();
     ctx.r3.u32 = 0;
 }
 
@@ -688,6 +766,26 @@ PPC_FUNC(__imp____C_specific_handler)
 // NT Kernel - Memory Management
 // ============================================================================
 
+// Watchpoint: track when 0x8200185C changes
+static uint32_t g_watch_last = 0;
+static bool g_watch_init = false;
+static void check_watchpoint(uint8_t* base, const char* where)
+{
+    uint32_t val = ppc_read_u32(base, 0x8200185C);
+    if (!g_watch_init)
+    {
+        g_watch_init = true;
+        g_watch_last = val;
+        fprintf(stderr, "[WATCH] Initial value at 0x8200185C = 0x%08X (%s)\n", val, where);
+    }
+    else if (val != g_watch_last)
+    {
+        fprintf(stderr, "[WATCH] 0x8200185C CHANGED: 0x%08X -> 0x%08X at %s\n",
+                g_watch_last, val, where);
+        g_watch_last = val;
+    }
+}
+
 // Simple bump allocator for NtAllocateVirtualMemory
 // Allocations start at 0xA0000000 in the PPC address space
 static uint32_t g_heap_next = 0xA0000000;
@@ -697,6 +795,7 @@ PPC_FUNC(__imp__NtAllocateVirtualMemory)
 {
     // r3 = BaseAddress* (in/out), r4 = RegionSize* (in/out), r5 = AllocationType, r6 = Protect
     STUB_LOG("NtAllocateVirtualMemory");
+    check_watchpoint(base, "NtAllocateVirtualMemory:entry");
     uint32_t base_ptr = ctx.r3.u32;
     uint32_t size_ptr = ctx.r4.u32;
     uint32_t size = ppc_read_u32(base, size_ptr);
@@ -738,6 +837,7 @@ PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
 {
     // r3 = type, r4 = size, r5 = protect, r6 = min addr, r7 = max addr, r8 = alignment
     STUB_LOG("MmAllocatePhysicalMemoryEx");
+    check_watchpoint(base, "MmAllocatePhysicalMemoryEx:entry");
     uint32_t size = ctx.r4.u32;
     size = (size + 0xFFF) & ~0xFFFu;
     if (g_heap_next + size <= g_heap_end)
@@ -892,6 +992,7 @@ static std::string xbox_path_to_host(const std::string& xbox_path)
 // r3=FileHandle*, r4=DesiredAccess, r5=ObjectAttributes*, r6=IoStatusBlock*
 static void NtOpenFile_impl(PPCContext& __restrict ctx, uint8_t* base)
 {
+    check_watchpoint(base, "NtOpenFile:entry");
     uint32_t handle_out_addr = ctx.r3.u32;
     uint32_t oa_addr = ctx.r5.u32;
     uint32_t iosb_addr = ctx.r6.u32;
@@ -1095,8 +1196,24 @@ PPC_FUNC(__imp__NtReadFile)
         _fseeki64(entry->fp, offset, SEEK_SET);
     }
 
+    // Check if the read would overwrite .rdata or other PE sections
+    if (buf_addr >= 0x82000000 && buf_addr < 0x82090000)
+    {
+        fprintf(stderr, "[FILE] NtReadFile: WARNING: buffer 0x%08X is in PE data section!\n", buf_addr);
+    }
+
     // Read directly into PPC memory (raw bytes, no endian swap needed for file data)
+    // Snapshot the watchpoint before the read
+    uint32_t watch_addr = 0x8200185C;
+    uint32_t watch_before = ppc_read_u32(base, watch_addr);
     size_t bytes_read = fread(base + buf_addr, 1, length, entry->fp);
+    uint32_t watch_after = ppc_read_u32(base, watch_addr);
+    if (watch_before != watch_after)
+    {
+        fprintf(stderr, "[WATCHPOINT] 0x%08X changed from 0x%08X to 0x%08X during NtReadFile "
+                "(buf=0x%08X, len=%u, file=%s)\n",
+                watch_addr, watch_before, watch_after, buf_addr, length, entry->host_path.c_str());
+    }
 
     // Fill IO_STATUS_BLOCK
     if (iosb_addr)
@@ -1105,8 +1222,8 @@ PPC_FUNC(__imp__NtReadFile)
         ppc_write_u32(base, iosb_addr + 4, (uint32_t)bytes_read);
     }
 
-    fprintf(stderr, "[FILE] NtReadFile: handle=0x%X, requested=%u, read=%zu\n",
-            handle_val, length, bytes_read);
+    fprintf(stderr, "[FILE] NtReadFile: handle=0x%X, buf=0x%08X, requested=%u, read=%zu\n",
+            handle_val, buf_addr, length, bytes_read);
     ctx.r3.u32 = 0; // STATUS_SUCCESS
 }
 
@@ -1424,18 +1541,21 @@ PPC_FUNC(__imp__NtDuplicateObject)
 PPC_FUNC(__imp__NtWaitForSingleObjectEx)
 {
     STUB_LOG_ONCE("NtWaitForSingleObjectEx");
+    if (g_current_thread) thread_yield();
     ctx.r3.u32 = 0;
 }
 
 PPC_FUNC(__imp__NtWaitForMultipleObjectsEx)
 {
     STUB_LOG_ONCE("NtWaitForMultipleObjectsEx");
+    if (g_current_thread) thread_yield();
     ctx.r3.u32 = 0;
 }
 
 PPC_FUNC(__imp__NtResumeThread)
 {
     // r3 = ThreadHandle, r4 = PreviousSuspendCount*
+    check_watchpoint(base, "NtResumeThread:entry");
     uint32_t thread_handle = ctx.r3.u32;
     uint32_t prev_count_ptr = ctx.r4.u32;
     fprintf(stderr, "[THREAD] NtResumeThread: handle=0x%08X\n", thread_handle);
@@ -1443,13 +1563,16 @@ PPC_FUNC(__imp__NtResumeThread)
     for (int i = 0; i < g_pending_thread_count; i++)
     {
         PendingThread& pt = g_pending_threads[i];
-        if (pt.handle == thread_handle && pt.suspended && !pt.ran)
+        if (pt.handle == thread_handle && pt.suspended && !pt.finished)
         {
-            fprintf(stderr, "[THREAD] Resuming suspended thread %d (handle=0x%X)\n", i, pt.handle);
+            fprintf(stderr, "[THREAD] Resuming thread %d (handle=0x%X) — giving immediate timeslice\n", i, pt.handle);
             pt.suspended = false;
             if (prev_count_ptr)
                 ppc_write_u32(base, prev_count_ptr, 1);
-            run_thread_inline(pt, i, ctx, base);
+            // Give the thread an immediate timeslice via fiber
+            // It will run until it yields (KeDelayExecutionThread etc.)
+            if (g_main_fiber)
+                thread_give_timeslice(pt, i);
             ctx.r3.u32 = 0; // STATUS_SUCCESS
             return;
         }
@@ -1470,6 +1593,7 @@ PPC_FUNC(__imp__ExCreateThread)
 {
     // r3 = ThreadHandle*, r4 = StackSize, r5 = ThreadId*, r6 = ApiThreadStartup,
     // r7 = StartRoutine, r8 = StartContext, r9 = CreateSuspended
+    check_watchpoint(base, "ExCreateThread:entry");
     uint32_t handle_ptr = ctx.r3.u32;
     uint32_t api_startup = ctx.r6.u32;
     uint32_t start_routine = ctx.r7.u32;
@@ -1484,13 +1608,31 @@ PPC_FUNC(__imp__ExCreateThread)
     // Queue the thread for later execution
     if (start_routine && g_pending_thread_count < MAX_PENDING_THREADS)
     {
-        g_pending_threads[g_pending_thread_count].handle = thread_handle;
-        g_pending_threads[g_pending_thread_count].start_routine = start_routine;
-        g_pending_threads[g_pending_thread_count].start_context = start_context;
-        g_pending_threads[g_pending_thread_count].api_startup = api_startup;
-        g_pending_threads[g_pending_thread_count].suspended = (suspended != 0);
-        g_pending_threads[g_pending_thread_count].ran = false;
+        PendingThread& pt = g_pending_threads[g_pending_thread_count];
+        pt.handle = thread_handle;
+        pt.start_routine = start_routine;
+        pt.start_context = start_context;
+        pt.api_startup = api_startup;
+        pt.suspended = (suspended != 0);
+        pt.finished = false;
+        pt.started = false;
+        pt.fiber = nullptr;
+        pt.base = base;
+        // Initialize thread PPC context from main context
+        pt.ppc_stack_top = alloc_thread_stack();
+        init_thread_ctx(pt, ctx);
+        int idx = g_pending_thread_count;
+        fprintf(stderr, "[THREAD]   -> thread %d, PPC stack=0x%08X\n",
+                idx, pt.ppc_stack_top);
         g_pending_thread_count++;
+
+        // Non-suspended threads start immediately on Xbox 360.
+        // Give them a fiber timeslice right away.
+        if (!pt.suspended && g_main_fiber)
+        {
+            fprintf(stderr, "[THREAD] Non-suspended thread %d — giving immediate timeslice\n", idx);
+            thread_give_timeslice(pt, idx);
+        }
     }
     ctx.r3.u32 = 0;
 }
@@ -1498,6 +1640,12 @@ PPC_FUNC(__imp__ExCreateThread)
 PPC_FUNC(__imp__ExTerminateThread)
 {
     STUB_LOG("ExTerminateThread");
+    // If called from a fiber thread, mark finished and switch back to main
+    if (g_current_thread)
+    {
+        g_current_thread->finished = true;
+        SwitchToFiber(g_main_fiber);
+    }
     ctx.r3.u32 = 0;
 }
 
@@ -1551,7 +1699,41 @@ PPC_FUNC(__imp__ExRegisterTitleTerminateNotification)
 PPC_FUNC(__imp__ExGetXConfigSetting)
 {
     // r3 = category, r4 = setting, r5 = buffer, r6 = buffer_size, r7 = required_size*
-    STUB_LOG("ExGetXConfigSetting");
+    uint32_t category = ctx.r3.u32;
+    uint32_t setting = ctx.r4.u32;
+    uint32_t buffer = ctx.r5.u32;
+    uint32_t buf_size = ctx.r6.u32;
+    uint32_t req_size_ptr = ctx.r7.u32;
+
+    // Handle known settings
+    if (category == 0x03 && setting == 0x09)
+    {
+        // XCONFIG_SECURED_AV_REGION: 0x00001000 = NTSC-U (North America)
+        uint32_t val = 0x00001000;
+        if (buf_size >= 4 && buffer)
+            ppc_write_u32(base, buffer, val);
+        if (req_size_ptr)
+            ppc_write_u32(base, req_size_ptr, 4);
+        fprintf(stderr, "[STUB] ExGetXConfigSetting(cat=%u, set=%u) -> AV_REGION=0x%X\n",
+                category, setting, val);
+        ctx.r3.u32 = 0; // STATUS_SUCCESS
+        return;
+    }
+    if (category == 0x03 && setting == 0x0A)
+    {
+        // XCONFIG_SECURED_GAME_REGION: 0x000000FF = all regions
+        uint32_t val = 0x000000FF;
+        if (buf_size >= 4 && buffer)
+            ppc_write_u32(base, buffer, val);
+        if (req_size_ptr)
+            ppc_write_u32(base, req_size_ptr, 4);
+        fprintf(stderr, "[STUB] ExGetXConfigSetting(cat=%u, set=%u) -> GAME_REGION=0x%X\n",
+                category, setting, val);
+        ctx.r3.u32 = 0;
+        return;
+    }
+
+    fprintf(stderr, "[STUB] ExGetXConfigSetting(cat=%u, set=%u) -> NOT_FOUND\n", category, setting);
     ctx.r3.u32 = 0xC0000225; // STATUS_NOT_FOUND
 }
 
@@ -1730,18 +1912,12 @@ PPC_FUNC(__imp__VdSwap)
     // Frame swap - this is where we'd present the frame.
     STUB_LOG_ONCE("VdSwap");
 
-    // On first swap call, run any non-suspended pending thread start routines.
-    // Suspended threads are run when KeResumeThread/NtResumeThread is called.
-    static bool s_threads_launched = false;
-    if (!s_threads_launched && g_pending_thread_count > 0)
+    // Give each ready thread a time slice via fibers
+    for (int i = 0; i < g_pending_thread_count; i++)
     {
-        s_threads_launched = true;
-        for (int i = 0; i < g_pending_thread_count; i++)
-        {
-            PendingThread& pt = g_pending_threads[i];
-            if (pt.suspended) continue;
-            run_thread_inline(pt, i, ctx, base);
-        }
+        PendingThread& pt = g_pending_threads[i];
+        if (!pt.suspended && !pt.finished)
+            thread_give_timeslice(pt, i);
     }
 
     // Pump Win32 messages and sleep to prevent 100% CPU usage.
@@ -1773,7 +1949,10 @@ PPC_FUNC(__imp__VdIsHSIOTrainingSucceeded)
 
 PPC_FUNC(__imp__VdRetrainEDRAM)
 {
-    STUB_LOG_ONCE("VdRetrainEDRAM");
+    STUB_LOG("VdRetrainEDRAM");
+    fprintf(stderr, "  LR=0x%08X\n", (uint32_t)ctx.lr);
+    fflush(stderr);
+    ctx.r3.u32 = 0; // STATUS_SUCCESS
 }
 
 PPC_FUNC(__imp__VdRetrainEDRAMWorker)
@@ -2195,11 +2374,19 @@ PPC_FUNC(__imp__NetDll_XNetCleanup)
 PPC_FUNC(__imp__NetDll_XNetRandom)
 {
     STUB_LOG_ONCE("NetDll_XNetRandom");
-    // r3 = buffer, r4 = length
-    uint32_t buf = ctx.r3.u32;
-    uint32_t len = ctx.r4.u32;
+    check_watchpoint(base, "NetDll_XNetRandom:entry");
+    // r3 = xnet handle (ignored), r4 = buffer, r5 = length
+    // NOTE: Xbox 360 NetDll functions take a handle in r3
+    uint32_t buf = ctx.r4.u32;
+    uint32_t len = ctx.r5.u32;
+    fprintf(stderr, "[NET] XNetRandom: buf=0x%08X, len=%u\n", buf, len);
+    if (buf >= 0x82000000 && buf < 0x82090000)
+    {
+        fprintf(stderr, "[NET] WARNING: XNetRandom writing to PE data section!\n");
+    }
     for (uint32_t i = 0; i < len; i++)
         base[buf + i] = (uint8_t)(rand() & 0xFF);
+    check_watchpoint(base, "NetDll_XNetRandom:exit");
     ctx.r3.u32 = 0;
 }
 
