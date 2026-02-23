@@ -38,6 +38,9 @@ tools/rexglue-sdk/
 # Build output directories
 project/out/
 
+# Debug screenshots
+whitescreen.png
+
 # Crash logs (debug artifacts)
 crash_log*.txt
 

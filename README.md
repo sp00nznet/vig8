@@ -2,13 +2,13 @@
 
 **Vigilante 8 Arcade** (Xbox 360 / XBLA) running natively on PC via static recompilation. No emulator. No interpreter. Just raw, recompiled C++ running at full speed.
 
-![Gameplay - Oil Fields](gameplay.png)
+![Gameplay - Oil Fields](images/gameplay.png)
 *Full 3D gameplay at 90 FPS — vehicles, terrain, weapons, HUD, and sky all rendering via D3D12*
 
-![Gameplay - Combat](gameplay2.png)
+![Gameplay - Combat](images/gameplay2.png)
 *Vehicular combat with weapon pickups, targeting, and particle effects*
 
-![Main Menu](screenshot.png)
+![Main Menu](images/screenshot.png)
 *Main menu at 92 FPS*
 
 ## How It Works
