@@ -11,16 +11,15 @@
 - **Base Address:** 0x82000000
 - **PE Data Offset:** 0x2000
 - **Module Flags:** 0x00000001
-- **Optional Header Count:** 15
+- **Game Engine:** IsopodEngine (custom)
 
 ## STFS Container
 
 The game is distributed as a LIVE (STFS) container:
 - **Magic:** LIVE (0x4C495645)
 - **Content Type:** 0x000D0000 (Xbox Live Arcade)
-- **Block Separation:** 1
 - **Total Container Size:** 123,797,504 bytes (118 MB)
-- **Extracted using:** Custom Python STFS extractor (`tools/extract_stfs.py`)
+- 59 files extracted: default.xex + data/ + achievement PNGs + rating PNGs
 
 ## ABI Addresses
 
@@ -39,73 +38,98 @@ All 8 required ABI functions located via PowerPC instruction pattern scanning.
 | setjmp | Not present | N/A |
 | longjmp | Not present | N/A |
 
-### Verification
-
-Address gaps match expected function sizes:
-- savegprlr_14 -> restgprlr_14: 0x50 bytes (80 = (32-14)*4 + 8)
-- savevmx_14 -> savevmx_64: 0x94 bytes (148 = (32-14)*8 + 4)
-- restvmx_14 -> restvmx_64: 0x94 bytes
-- savevmx_64 -> restvmx_14: 0x204 bytes (516 = (128-64)*8 + 4)
-
 ## Jump Tables
 
-80 jump tables detected by XenonAnalyse:
-- **Absolute jump tables:** ~50
-- **Computed jump tables:** ~20
-- **Offset jump tables:** ~10
+81 jump tables (80 detected by XenonAnalyse + 1 manual):
+- Absolute, computed, and offset types
+- Manual addition: zlib inflate state machine at 0x8212DD34 (30 entries, u16 relative offsets)
+- Saved to `config/vig8_switch_tables.toml`
 
-Saved to `config/vig8_switch_tables.toml`.
+## Recompilation Statistics
 
-## Recompilation Statistics (Initial Pass)
+### Legacy (raw XenonRecomp)
 
 | Metric | Value |
 |--------|-------|
 | Generated C++ files | 48 implementation + 3 headers + 1 mapping |
 | Total lines of C++ | 1,833,509 |
 | Total generated size | 58.36 MB |
-| Recompiled functions | ~12,000+ |
-| Switch case errors | 72 |
-| Unrecognized instructions | ~10,299 |
-| RC bit warnings | 53 |
+| Functions | ~12,000 |
 
-## Unrecognized Instructions
+### Current (ReXGlue SDK)
 
-Instruction types not handled by XenonRecomp:
+| Metric | Value |
+|--------|-------|
+| Generated C++ files | 17 implementation + 3 headers |
+| Total generated size | ~60 MB |
+| Functions recompiled | 8,059 |
+| Function overrides | 31 (vtable entries, thunks, merged functions) |
+| Unimplemented instructions | 1 (cctph — handled as no-op) |
 
-| Instruction | Category | Count (approx) |
-|-------------|----------|-----------------|
-| vnor128 | VMX128 | ~5 |
-| cctph | Unknown | ~1 |
-| vsubshs | Altivec | Many |
-| vaddsbs | Altivec | Several |
-| vsrah | Altivec | Several |
-| vcmpgtsh | Altivec | Several |
-| vspltish | Altivec | Many |
-| vmaxsh | Altivec | Many |
-| vminsh | Altivec | Several |
-| vavguh | Altivec | Many |
-| eqv | PPC Integer | Several |
+## Function Overrides in Config
 
-Most of these are **standard Altivec SIMD instructions** that XenonRecomp doesn't implement yet. They are commonly used for:
-- Audio processing (IDCT, sample manipulation)
-- Texture/image processing
-- Physics calculations
-- General vectorized math
+31 manual function definitions in `vig8_rexglue.toml`:
+
+| Category | Count | Purpose |
+|----------|-------|---------|
+| Original analysis fixes | 11 | Switch case boundary corrections |
+| C++ this-adjustor thunks | 14 | 2-instruction vtable wrappers (`addi r3; b target`) |
+| Game logic vtable functions | 5 | Functions only called via vtable dispatch |
+| Cross-function goto merge | 1 | sub_8219F570 + sub_8219F6C0 → single function |
+
+### Missing Vtable Functions
+
+Automated vtable scanner (`find_missing_vtable_funcs.py`) identified 129 total vtable entries missing from the function table:
+- 17 high-priority (added to config)
+- 112 library/CRT functions (lower priority, some may not be reached)
 
 ## Game Asset Format
 
-The game uses a custom `.ib` / `.ibz` file format:
-- `.ib` files appear to be uncompressed game data bundles
-- `.ibz` files are likely compressed variants (zlib?)
-- Files include: levels (Farmland, HooverDam, etc.), vehicles (boogie, chassey, dave, etc.), UI (menu, hud), audio (sounds, v8theme), text localizations
+Custom `.ib` / `.ibz` format (IsopodEngine):
+- `.ib` — Uncompressed data bundles
+- `.ibz` — zlib-compressed bundles
+- 38 data files total
 
-## Functions Needing Manual Boundaries
+| Category | Files |
+|----------|-------|
+| Config | Config.ib, default.ib, microflakemap.ib, weaponparams.ibz |
+| Characters | boogie.ib, chassey.ib, dave.ib, molo.ib, torque.ib |
+| Vehicles | GrooVan.ibz, Incarcerator.ibz, Leprechaun.ibz, Mammoth.ibz, Manta.ibz, Piranha.ibz, Saucer.ibz, Stag.ibz |
+| Levels | Farmland.ibz, FartyDog.ibz, HooverDam.ibz, Jefferson.ibz, MeteorCrater.ibz, OilFields.ibz, SkiResort.ibz |
+| UI/Effects | hud.ibz, menu.ibz, Debris.ibz, Particles.ibz, Surface.ibz, Weapons.ibz |
+| Audio/Text | sounds.ib, v8theme.ib, Text_ENG.ibz (+ FRE, GER, ITA, JAP, SPA) |
 
-Switch case errors indicate these functions need manual `functions` entries in the TOML:
+## Kernel Import Usage
 
-| Function Base | Error Type |
-|---------------|------------|
-| 0x8211FBD0 | Switch cases jump outside detected boundary |
-| 0x821368BC | Switch cases jump outside detected boundary |
-| 0x821A4628 | Switch cases jump outside detected boundary |
-| Others TBD | Need to analyze remaining 72 errors |
+The game imports from two Xbox 360 modules:
+
+**xboxkrnl.exe** — Core kernel APIs:
+- Threading: ExCreateThread, KeWaitForSingleObject, KeSetEvent, KeDelayExecutionThread
+- Memory: NtAllocateVirtualMemory, MmAllocatePhysicalMemoryEx
+- File I/O: NtOpenFile, NtReadFile, NtQueryDirectoryFile, NtClose
+- GPU: VdInitializeEngines, VdInitializeRingBuffer, VdSwap, VdSetGraphicsInterruptCallback
+- Sync: RtlInitializeCriticalSection, KfAcquireSpinLock
+- Audio: XMACreateContext, XAudioRegisterRenderDriverClient
+
+**xam.xex** — Xbox Application Manager:
+- Input: XamInputGetState, XamInputGetCapabilities
+- Profiles: XamUserGetSigninState, XamUserGetName
+- UI: XamShowGamerCardUI, XamShowMarketplaceUI
+- Network: XamNotifyCreateListener, XNetConnect, XNetGetConnectStatus
+- Content: XamContentCreateEnumerator, XamContentCreate
+
+## Xbox 360 Technical Notes
+
+### NetDll Calling Convention
+Xbox 360 NetDll functions take an xnet handle as the first parameter (r3), shifting all other parameters by 1 register. This is unlike standard kernel APIs.
+
+### NtQueryDirectoryFile
+On Xbox 360, always uses FileDirectoryInformation (class 1, 0x40 header). The r10 parameter is a FileName ANSI_STRING* filter, NOT FileInformationClass (unlike desktop Windows).
+
+### Thread Priority Hints
+`cctph`/`cctpm`/`cctpl` are PowerPC thread scheduling hints encoded as `or rN,rN,rN`. They're no-ops on x86-64.
+
+### Guest Memory Model
+- 4GB guest space allocated at host address 0x100000000
+- Guest address 0x82000000 = host address 0x182000000
+- Guest address 0x00000000 = host address 0x100000000 (null page)

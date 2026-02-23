@@ -1,144 +1,128 @@
-# XenonRecomp Workflow for Vigilante 8 Arcade
+# Static Recompilation Workflow for Xbox 360 Titles
+
+## Overview
+
+This document describes the workflow for statically recompiling an Xbox 360 (XEX) title to run natively on PC. The approach has two generations:
+
+- **Legacy (raw XenonRecomp)** — Manual codegen + hand-built runtime (used for initial bring-up)
+- **Current (ReXGlue SDK)** — Integrated codegen + full runtime SDK with GPU, audio, and input
+
+This project uses the **ReXGlue SDK** approach.
 
 ## Tool Overview
 
-**XenonRecomp** (https://github.com/hedge-dev/XenonRecomp) is a static recompiler that converts Xbox 360 PowerPC executables into C++ source code compilable for x86-64.
+### XenonRecomp
+[XenonRecomp](https://github.com/hedge-dev/XenonRecomp) is a static recompiler that converts Xbox 360 PowerPC executables into C++ source code compilable for x86-64. Each PowerPC function maps to a C++ function operating on a `PPCContext` struct (32 GPRs, 32 FPRs, 128 vector regs, CR, CTR, XER, LR, MSR, FPSCR).
 
-### What it produces
-- C++ source files with 1:1 translated PowerPC functions
-- Each function operates on a `ppc_context` struct (32 GPRs, 32 FPRs, 128 vector regs, CR, CTR, XER, LR, MSR, FPSCR)
-- Functions use weak linking for easy hooking (`PPC_FUNC` / `PPC_FUNC_IMPL`)
-- Handles big-endian to little-endian byte-swapping automatically
-- Converts jump tables to C++ switch statements
-- Supports mid-ASM hooks for injecting custom code at specific addresses
+### ReXGlue SDK
+The ReXGlue SDK wraps XenonRecomp's codegen with a complete Xbox 360 runtime:
+- **rex::kernel** — Threading, sync, memory, file I/O, kernel APIs
+- **rex::graphics** — D3D12-based Xenos GPU emulation, shader translation
+- **rex::ui** — Windowed app framework, ImGui integration
+- **Audio** — XMA decoding and playback
+- **Input** — XInput controller support
 
-### What it does NOT provide
-- No runtime implementation (graphics, audio, input, I/O, memory, threading)
-- No MMIO operations
-- No exception handling support
+## Step-by-Step Workflow (ReXGlue)
 
-## Step-by-Step Workflow
-
-### Step 1: Build XenonRecomp
+### Step 1: Set Up the ReXGlue SDK
 
 ```bash
-git clone --recursive https://github.com/hedge-dev/XenonRecomp.git tools/XenonRecomp
-cd tools/XenonRecomp
-mkdir build && cd build
-cmake ..
-cmake --build . --config Release
+# Clone and build the SDK
+cd tools/rexglue-sdk
+cmake --preset win-amd64
+cmake --build out/build/win-amd64 --config Release --target install
 ```
 
-**Requirements:** CMake 3.20+, Clang 18+, C++17
+### Step 2: Create the Codegen Config
 
-**Bundled dependencies (submodules):**
-- xxHash, fmt, tomlplusplus, libmspack (LZX decompression), tiny-AES-c (AES decryption)
-
-### Step 2: Run XenonAnalyse
-
-```bash
-XenonAnalyse "Vigilante 8 Arcade" config/vig8_switch_tables.toml
-```
-
-This scans the XEX to detect jump tables and outputs a TOML file listing them.
-
-### Step 3: Locate ABI Addresses
-
-Using a hex editor (HxD, 010 Editor, etc.), search the XEX binary for the PowerPC ABI register save/restore functions. These are standard Xbox 360 ABI routines.
-
-**Byte patterns to search for:**
-
-- **savegprlr** / **restgprlr** - General purpose register save/restore with link register
-- **savefpr** / **restfpr** - Floating point register save/restore
-- **savevmx** / **restvmx** - VMX (Altivec/vector) register save/restore
-- **setjmp** / **longjmp** - C runtime jump functions
-
-These addresses vary per game build. Record them for the TOML config.
-
-### Step 4: Create TOML Configuration
+Create a TOML config (e.g., `config/vig8_rexglue.toml`) with:
 
 ```toml
 [main]
-file_path = "../Vigilante 8 Arcade"
-out_directory_path = "../ppc"
-switch_table_file_path = "vig8_switch_tables.toml"
+file_path = "../extracted/default.xex"
+out_directory_path = "../generated"
 
-# ABI addresses (MUST be found in the actual binary)
-restgprlr_14_address = 0x00000000  # TODO: find
-savegprlr_14_address = 0x00000000  # TODO: find
-restfpr_14_address = 0x00000000    # TODO: find
-savefpr_14_address = 0x00000000    # TODO: find
-restvmx_14_address = 0x00000000   # TODO: find
-savevmx_14_address = 0x00000000   # TODO: find
-restvmx_64_address = 0x00000000   # TODO: find
-savevmx_64_address = 0x00000000   # TODO: find
+# ABI addresses (found via hex search in XEX binary)
+restgprlr_14_address = 0x82310F50
+savegprlr_14_address = 0x82310F00
+# ... etc
 
-# Optional
-longjmp_address = 0x00000000      # TODO: find
-setjmp_address = 0x00000000       # TODO: find
-
-[optimizations]
-# Leave all disabled for initial pass
-skip_lr = false
-skip_msr = false
-ctr_as_local = false
-xer_as_local = false
-reserved_as_local = false
-cr_as_local = false
-non_argument_as_local = false
-non_volatile_as_local = false
+[functions]
+# Manual function boundary overrides
+# Vtable functions missed by static analysis:
+0x821A17D0 = { end = 0x821A17E8 }
+# Cross-function goto fixes (merge split functions):
+0x8219F570 = { end = 0x8219F950 }
+# C++ this-adjustor thunks:
+0x8216B558 = { end = 0x8216B560 }
 ```
 
-### Step 5: Run XenonRecomp
+### Step 3: Run Codegen
 
 ```bash
-mkdir -p ppc
-XenonRecomp config/vig8.toml tools/XenonRecomp/XenonUtils/ppc_context.h
+tools/rexglue-sdk/out/install/win-amd64/bin/rexglue.exe codegen
 ```
 
-**Output files generated in `ppc/`:**
+This generates:
+- `generated/vig8_config.h` — Address constants
+- `generated/vig8_init.h` — Function declarations + table
+- `generated/vig8_init.cpp` — Function table mappings
+- `generated/vig8_recomp.*.cpp` — Recompiled C++ source files
+- `generated/sources.cmake` — CMake source list
 
-| File | Purpose |
-|------|---------|
-| `ppc_config.h` | Configuration defines and memory layout |
-| `ppc_context.h` | PowerPC execution context structure |
-| `ppc_recomp_shared.h` | Function declarations and shared definitions |
-| `ppc_func_mapping.cpp` | Address-to-function resolution hash table |
-| `ppc_recomp.*.cpp` | Implementation files (split every 256 functions) |
+### Step 4: Apply Post-Codegen Fixes
 
-### Step 6: Build Runtime (The Hard Part)
+**CRITICAL:** Codegen overwrites `vig8_init.h` every run. You must re-apply:
 
-The generated C++ is just the translated game logic. To actually run the game, we need:
+1. **Safe PPC_CALL_INDIRECT_FUNC** — The SDK's default macro does raw lookup+call with no NULL check. Override with a version that checks for NULL targets, out-of-range addresses, and missing function slots.
 
-1. **Memory management** - Map Xbox 360 virtual address space, handle big-endian memory
-2. **Graphics** - Translate Xenos GPU draw calls to D3D12 or Vulkan
-3. **Shaders** - Recompile Xenos shaders to HLSL/SPIR-V (XenosRecomp)
-4. **Audio** - Implement XMA/PCM audio decoding and playback
-5. **Input** - Map Xbox 360 controller calls to PC input
-6. **File I/O** - Redirect Xbox 360 file system calls to PC paths
-7. **Threading** - Map Xbox 360 threading primitives to Windows/POSIX threads
-8. **System calls** - Stub or implement Xbox 360 kernel calls (XAM, XEX loader, etc.)
+2. **PPC_UNIMPLEMENTED override** — Change from `throw` to warn-and-skip for instructions like `cctph` (thread priority hints that are safe no-ops).
 
-### Step 7: Iterate
+### Step 5: Build
 
-- Fix recompilation errors (invalid instructions, missing function boundaries)
-- Add `functions` entries in TOML for functions that couldn't be auto-detected
-- Add `invalid_instructions` entries for data embedded in code sections
-- Add mid-ASM hooks where needed
+```bash
+cd project
+cmake --preset win-amd64
+cmake --build out/build/win-amd64 --config Release
+```
 
-### Step 8: Optimize (After Everything Works)
+### Step 6: Run and Iterate
 
-Enable TOML optimization flags one by one:
-1. `non_volatile_as_local = true` (biggest impact - ~20MB size reduction)
-2. `cr_as_local = true`
-3. `non_argument_as_local = true`
-4. etc.
+```bash
+project/out/build/win-amd64/Release/vig8.exe extracted/
+```
 
-## Reference: UnleashedRecomp
+Common issues to fix iteratively:
+- **Missing vtable functions** — Use `find_missing_vtable_funcs.py` to scan data section
+- **Cross-function gotos** — Merge incorrectly-split functions in config
+- **Missing kernel APIs** — Add stub implementations in `stubs.cpp`
+- **Unimplemented instructions** — Override `PPC_UNIMPLEMENTED` or fix in codegen
 
-The only completed XenonRecomp project is [Sonic Unleashed Recompiled](https://github.com/hedge-dev/UnleashedRecomp). Key takeaways:
-- Took ~6 months of development
-- Uses D3D12 + Vulkan rendering backends
-- Custom Xenos shader -> HLSL translator
-- Extensive mid-ASM hooking for graphics/audio/input
-- Good reference architecture for our runtime
+## Finding ABI Addresses
+
+Using a hex editor, search the XEX binary for PowerPC ABI register save/restore functions:
+
+| Function | Purpose |
+|----------|---------|
+| savegprlr_14 / restgprlr_14 | General purpose register save/restore with link register |
+| savefpr_14 / restfpr_14 | Floating point register save/restore |
+| savevmx_14 / restvmx_14 | VMX (Altivec/vector) register save/restore |
+| savevmx_64 / restvmx_64 | VMX 64-bit variant save/restore |
+
+These addresses vary per game build and must be found in the actual binary.
+
+## Common Patterns and Fixes
+
+### Vtable Dispatch Safety
+Xbox 360 games use C++ virtual method tables extensively. In recompiled code, vtable calls go through `PPC_CALL_INDIRECT_FUNC`. The SDK's default implementation will crash on any NULL or unresolved entry. Always override with null-safe version.
+
+### Guest Null Page Handler
+Games often dereference uninitialized pointers. A VEH handler can catch access violations in the guest null page (address 0x0-0xFFFF in guest space), decode the x86-64 load instruction, zero the destination register, and skip the instruction.
+
+### Thread Priority Hints
+`cctph`/`cctpm`/`cctpl` are PowerPC thread scheduling hints (`or rN,rN,rN` encodings). They're safe no-ops on x86-64 — override `PPC_UNIMPLEMENTED` to handle them.
+
+## Reference Projects
+
+- [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp) — Sonic Unleashed static recomp (most complete reference)
+- [N64: Recompiled](https://github.com/N64Recomp/N64Recomp) — N64 static recomp (different architecture, same concept)

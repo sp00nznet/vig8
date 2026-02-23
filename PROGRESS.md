@@ -15,11 +15,13 @@
 | 5d. File I/O | Handle table, path translation, directory enumeration | DONE |
 | 5e. Threading | Fiber-based cooperative threading (ExCreateThread, yield) | DONE |
 | 5f. GPU Init | Ring buffer, EDRAM, render threads, XConfig | DONE |
-| 6. Graphics | Xenos -> D3D12/Vulkan rendering | NOT STARTED |
-| 7. Audio | Audio system implementation | NOT STARTED |
-| 8. Input | Controller/keyboard input | NOT STARTED |
-| 9. Integration | Full game loop, menus, gameplay | NOT STARTED |
-| 10. Polish | Optimizations, bug fixes, testing | NOT STARTED |
+| 6. ReXGlue Migration | Migrate from raw XenonRecomp to ReXGlue SDK | DONE |
+| 7. Vtable & Crash Fixes | Fix indirect calls, missing functions, null page | DONE |
+| 8. Graphics | D3D12 GPU pipeline, shader translation | IN PROGRESS |
+| 9. Audio | XMA audio decoding & playback | DONE (via ReXGlue) |
+| 10. Input | Controller input + rumble | DONE (via ReXGlue) |
+| 11. Gameplay | Game loads into rounds, HUD functional | IN PROGRESS |
+| 12. Polish | 3D world rendering, optimizations | NOT STARTED |
 
 ---
 
@@ -348,19 +350,62 @@ VdGetSystemCommandBuffer, VdSwap
 
 ---
 
+### 2026-02-23 - ReXGlue SDK Migration & Full GPU Pipeline
+
+**Completed:**
+- [x] **Migrated from raw XenonRecomp to ReXGlue SDK**
+  - ReXGlue provides: rex::Runtime, rex::kernel (threads, sync, file I/O, memory), rex::graphics (D3D12 GPU emulation, Xenos shader translation), rex::ui (windowed app, ImGui), audio (XMA decode)
+  - New project structure: `project/CMakeLists.txt` linking rex::core, rex::runtime, rex::kernel, rex::graphics, rex::ui
+  - Codegen via `rexglue.exe codegen` (replaces manual XenonRecomp + XenonAnalyse)
+  - 8,059 functions recompiled across 17 source files
+- [x] **Safe PPC_CALL_INDIRECT_FUNC macro override**
+  - SDK's default macro does raw lookup+call with NO null check — instant crash on any unresolved vtable call
+  - Override adds: NULL target check, out-of-range check, NULL function slot check
+  - All gracefully return r3=0 and skip instead of crashing
+  - Must re-apply after every `rexglue codegen` run (it overwrites vig8_init.h)
+- [x] **PPC_UNIMPLEMENTED override** — warn-and-skip instead of throwing
+  - `cctph` (thread priority hint) was throwing std::runtime_error, crashing on level load
+  - Override logs warning and continues as no-op
+- [x] **20 missing vtable function entries added to config**
+  - 14 C++ this-adjustor thunks (2-instruction: `addi r3,r3,offset; b target`)
+  - 3 game-logic functions missed by static analysis (only called via vtable)
+  - 3 additional functions discovered during runtime
+  - Automated vtable scanner (`find_missing_vtable_funcs.py`) found 129 total missing entries
+- [x] **Cross-function goto fix**: sub_8219F570 and sub_8219F6C0 were one function incorrectly split by analysis. Merged via `0x8219F570 = { end = 0x8219F950 }` in config
+- [x] **VEH null page handler**: Guest null pointer dereferences (reads from host 0x100000000) handled by decoding x86-64 MOV/MOVZX/MOVSX/MOVSXD instructions, zeroing destination register, and skipping
+- [x] **VEH crash diagnostics**: Vectored exception handler logs all crashes with register dumps, PPC context extraction, stack traces, and C++ exception message decoding (MSVC 0xE06D7363)
+- [x] **Windowed app** (Vig8App) with ImGui debug overlay (FPS counter)
+- [x] **Console test harness** (vig8_test.exe) for headless crash debugging
+
+**Game Progress — GAMEPLAY REACHED:**
+- Main menu renders fully (V8 logo, menu text, vehicle artwork, background) at 56 FPS
+- Audio plays (XMA decoding active)
+- Controller input works (navigate menus, select options, rumble feedback)
+- Game loads into rounds: HUD visible (minimap with moving enemies, targeting reticles, health bars)
+- Controller rumble active during combat (being shot triggers vibration)
+- **3D world renders white** — HUD overlay works perfectly but terrain/vehicles/skybox not visible
+  - GPU pipeline is active (D3D12 command processor running, shaders translating)
+  - Investigating shader translation or render state issue for 3D geometry
+
+**Key Technical Discoveries:**
+- ReXGlue SDK's PPC_CALL_INDIRECT_FUNC has no safety checks — must override for any game with C++ vtable dispatch
+- `cctph`/`cctpl`/`cctpm` are PowerPC thread priority hints (`or rN,rN,rN` encodings) — safe no-ops on x86-64
+- MSVC C++ exception code 0xE06D7363 can be decoded in VEH by reading ExceptionInformation[1] as std::exception*
+- vig8_init.h gets overwritten by codegen — must maintain a post-codegen fixup step
+
+---
+
 ## Next Steps
 
-1. **Debug main thread stall** — game enters pure PPC code loop after input init, likely polling GPU ring buffer read pointer or waiting for render thread synchronization
-2. Implement GPU ring buffer read-pointer writeback (instant GPU command "processing")
-3. Begin Xenos GPU command buffer parsing for graphics
-4. Create D3D12/Vulkan device and swap chain on the window
-5. Contribute instruction patches upstream to XenonRecomp
+1. **Fix 3D world rendering** — investigate shader translation, render state, or depth buffer issue causing white background in gameplay
+2. **Expand null page handler** — handle additional x86-64 instruction encodings for guest null pointer reads
+3. **Add remaining vtable functions** — 112 library/CRT entries still missing from function table
+4. Contribute instruction patches upstream to XenonRecomp/ReXGlue
 
 ---
 
 ## Open Questions
 
-1. What engine does Vigilante 8 Arcade use? (custom engine likely given .ib format)
-2. Does it have any title update patches (XEXP files)?
-3. What graphics API complexity do we expect? (Xenos shader count, render pipeline)
-4. Are there any known modding/reverse engineering resources for this game?
+1. ~~What engine does Vigilante 8 Arcade use?~~ Custom engine (IsopodEngine) with .ib/.ibz asset format
+2. Why does 3D scene render white while HUD renders correctly? (same GPU pipeline, different shader/state path)
+3. Are there specific Xenos shader features this game uses that the D3D12 translator doesn't handle?

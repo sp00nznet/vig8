@@ -1,175 +1,159 @@
-# Vigilante 8 Arcade - Static Recompilation Project
+# Vigilante 8 Arcade - Static Recompilation
 
-A static recompilation of **Vigilante 8 Arcade** (Xbox 360 / XBLA) to native x86-64 PC using [XenonRecomp](https://github.com/hedge-dev/XenonRecomp).
+**Vigilante 8 Arcade** (Xbox 360 / XBLA) running natively on PC via static recompilation. No emulator. No interpreter. Just raw, recompiled C++ running at full speed.
 
-## Project Goal
+![Main Menu](screenshot.png)
+*Main menu rendering at 56 FPS via D3D12 — menus, audio, input, and HUD all functional*
 
-Translate the Xbox 360 PowerPC executable of Vigilante 8 Arcade into native C++ code that can be compiled and run on modern PCs, preserving the original game logic while replacing Xbox 360 system services with PC equivalents.
+## How It Works
 
-## What is Static Recompilation?
+Instead of emulating a PowerPC CPU instruction-by-instruction at runtime, this project translates the **entire Xbox 360 binary** into equivalent C++ source code ahead of time. The result: **1.8 million lines of generated C++** across 49 files that compile into a native x86-64 executable. The game logic runs at full speed because it IS native code — no JIT, no interpreter, no CPU emulation overhead.
 
-Unlike emulation (which interprets instructions at runtime), static recompilation translates the entire binary ahead of time into equivalent C++ source code. Each PowerPC instruction maps to C++ code operating on a CPU state struct. The result is a native executable that runs at full speed without an emulator.
+The Xbox 360's Xenos GPU commands are processed by a D3D12 backend (derived from the [Xenia](https://github.com/xenia-project/xenia) emulator's GPU code), translating Xbox 360 shaders to PC shaders in real-time.
 
-## Project Status
+**Built with:**
+- [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) — PowerPC static recompiler by hedge-dev
+- [ReXGlue SDK](https://github.com/hedge-dev/XenonRecomp) — Runtime SDK providing Xbox 360 kernel, GPU (D3D12), audio (XMA), and input emulation
 
-See [PROGRESS.md](PROGRESS.md) for detailed progress tracking.
+## Current Status
 
-**Current Phase:** GPU initialization complete, cooperative threading with fibers, game loads data and initializes rendering pipeline
+The game boots, navigates menus, loads levels, and enters gameplay. Audio plays, controllers work with rumble, and the HUD renders correctly. 3D world rendering is in progress (shaders translating, geometry pipeline active — tuning render state for full scene visibility).
 
-| Milestone | Status |
+| What Works | Status |
 |-----------|--------|
-| XEX extraction & analysis | Done |
-| ABI address detection | Done |
-| Jump table analysis (80 tables) | Done |
-| Switch case boundary fixes | Done |
-| Altivec/VMX instruction support (30+ opcodes added to XenonRecomp) | Done |
-| Clean recompilation (0 errors, 0 warnings) | Done |
-| Runtime skeleton & build system | Done |
-| PE extraction & data section loading | Done |
-| Xbox 360 kernel import stubs (205 functions) | Done |
-| Successful build & link (19.7 MB native exe) | Done |
-| CRT initialization & game boot | Done |
-| Game main loop running (Update/Render cycle) | Done |
-| Win32 window (1280x720, message pump) | Done |
-| File I/O: handle table, path translation, directory enumeration | Done |
-| Game data loading: Text_ENG.ibz, menu.ibz via zlib decompress | Done |
-| Switch table: zlib inflate state machine (81 tables total) | Done |
-| Fiber-based cooperative threading (ExCreateThread, KeWait*, yield) | Done |
-| GPU init: VdInitializeRingBuffer, VdRetrainEDRAM, render threads | Done |
-| Xbox 360 config: AV_REGION, GAME_REGION (ExGetXConfigSetting) | Done |
-| Graphics (Xenos -> D3D12/Vulkan) | Not Started |
-| Audio / Input / Integration | Not Started |
-
-**Recompilation Output:** 1.8M+ lines of C++ across 49 source files (63 MB)
-
-## Repository Structure
-
-```
-vig8/
-├── config/                        # XenonRecomp configuration
-│   ├── vig8.toml                  # Main recomp config (ABI addresses, manual function defs)
-│   └── vig8_switch_tables.toml    # 80 jump table definitions
-├── docs/                          # Documentation and research notes
-│   ├── xenonrecomp-workflow.md
-│   └── binary-analysis.md
-├── src/                           # Runtime implementation source code
-│   ├── main.cpp                   # Entry point, Win32 window, PPC context setup, launches _xstart
-│   ├── memory.cpp/h               # 4GB PPC memory space (VirtualAlloc/mmap)
-│   ├── xex_loader.cpp/h           # PE image data section loader
-│   ├── kernel_stubs.cpp           # 205 Xbox 360 kernel/XAM/system stubs
-│   └── math_polyfill.cpp          # C23 math function polyfills for MSVC
-├── tools/                         # Toolchain (gitignored, built locally)
-│   ├── XenonRecomp/               # Patched XenonRecomp with Altivec/VMX extensions
-│   ├── patches/                   # XenonRecomp source patches
-│   ├── dump_pe.cpp                # PE image extractor (links against XenonUtils)
-│   └── extract_pe.py              # Python XEX decryption tool (requires pycryptodome)
-├── extracted/                     # Extracted game files (gitignored)
-│   ├── default.xex                # Xbox 360 executable
-│   ├── pe_image.bin               # Decrypted/decompressed PE image
-│   └── data/                      # 38 game data files (.ib/.ibz)
-├── ppc/                           # Generated C++ output (gitignored, reproducible)
-├── build/                         # CMake build directory (gitignored)
-├── CMakeLists.txt                 # Build system (Clang + Ninja)
-├── .gitignore
-├── PROGRESS.md                    # Detailed progress log
-└── README.md                      # This file
-```
-
-## Prerequisites
-
-- **CMake 3.20+**
-- **Clang 18+** (required by XenonRecomp and generated code)
-- **Ninja** (recommended build system)
-- **Python 3.8+** with `pycryptodome` (for XEX decryption)
-- **Git**
-- A legally obtained copy of **Vigilante 8 Arcade** XEX
+| Game boot & CRT initialization | Working |
+| Menu navigation & UI | Working |
+| Audio playback (XMA decode) | Working |
+| Controller input + rumble | Working |
+| HUD rendering (minimap, targeting, health) | Working |
+| File I/O (38 game data files) | Working |
+| Fiber-based cooperative threading (6 threads) | Working |
+| GPU pipeline (D3D12, shader translation) | Working |
+| 3D world rendering | In Progress |
+| Multiplayer / networking | Stubbed (returns offline) |
 
 ## Quick Start
 
+### Prerequisites
+- **Windows 10/11** (D3D12 required)
+- **CMake 3.25+**
+- **Clang 18+** (MSVC frontend via clang-cl)
+- **Ninja** build system
+- A legally obtained copy of **Vigilante 8 Arcade** (Xbox 360 XBLA)
+
+### Build
+
 ```bash
-# 1. Clone this repo
+# 1. Clone
 git clone https://github.com/sp00nznet/vig8.git
 cd vig8
 
-# 2. Place your extracted default.xex in extracted/default.xex
+# 2. Place your extracted game files in extracted/
+#    (default.xex + data/ directory with .ib/.ibz files)
 
-# 3. Clone and build XenonRecomp (with our Altivec/VMX patches)
-git clone --recursive https://github.com/hedge-dev/XenonRecomp.git tools/XenonRecomp
-# Apply patches from tools/patches/ (see below)
-cd tools/XenonRecomp
-cmake -B build -G Ninja
-cmake --build build --config Release
+# 3. Build the ReXGlue SDK (one-time setup)
+cd tools/rexglue-sdk
+cmake --preset win-amd64
+cmake --build out/build/win-amd64 --config Release --target install
 cd ../..
 
-# 4. Extract PE image from XEX (decrypt + decompress)
-# Option A: Using the C++ tool (faster, links against XenonUtils)
-clang++ -std=c++20 -O2 -I tools/XenonRecomp/XenonUtils -I tools/XenonRecomp/thirdparty \
-    tools/dump_pe.cpp tools/XenonRecomp/build/XenonUtils/XenonUtils.lib -o tools/dump_pe.exe
-tools/dump_pe.exe extracted/default.xex extracted/pe_image.bin
+# 4. Run codegen (generates C++ from XEX binary)
+tools/rexglue-sdk/out/install/win-amd64/bin/rexglue.exe codegen
 
-# Option B: Using Python (requires pycryptodome)
-pip install pycryptodome
-python tools/extract_pe.py extracted/default.xex extracted/pe_image.bin
+# 5. Re-apply safe macro override in generated/vig8_init.h
+#    (see PROGRESS.md for the PPC_CALL_INDIRECT_FUNC override)
 
-# 5. Run analysis and recompilation
-cd config
-../tools/XenonRecomp/build/XenonAnalyse/XenonAnalyse ../extracted/default.xex vig8_switch_tables.toml
-../tools/XenonRecomp/build/XenonRecomp/XenonRecomp vig8.toml ../tools/XenonRecomp/XenonUtils/ppc_context.h
+# 6. Build the game
+cd project
+cmake --preset win-amd64
+cmake --build out/build/win-amd64 --config Release
 cd ..
 
-# 6. Build the native executable
-cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
-    -DCMAKE_RC_COMPILER=llvm-rc
-cmake --build build
-
 # 7. Run
-./build/vig8.exe
+project/out/build/win-amd64/Release/vig8.exe extracted/
 ```
 
-## XenonRecomp Patches
+## Project Structure
 
-This project required adding 30+ missing Altivec/VMX instruction handlers to XenonRecomp.
-Patches are maintained in the `tools/patches/` directory. Key additions:
+```
+vig8/
+├── config/
+│   ├── vig8_rexglue.toml          # ReXGlue codegen config (function overrides, switch tables)
+│   ├── vig8.toml                  # Legacy XenonRecomp config
+│   └── vig8_switch_tables.toml    # 81 jump table definitions
+├── generated/                     # ReXGlue codegen output
+│   ├── vig8_config.h              # Address constants (code base, image base)
+│   ├── vig8_init.h/cpp            # Function table + safe macro overrides
+│   └── vig8_recomp.*.cpp          # 17 recompiled source files (gitignored, ~60MB)
+├── project/                       # CMake project
+│   ├── CMakeLists.txt             # Build system (links rex::core/runtime/kernel/graphics/ui)
+│   └── src/
+│       ├── main.cpp               # Windowed app, VEH crash handlers, null page handler
+│       ├── stubs.cpp              # Stub implementations for missing kernel APIs
+│       └── test_boot.cpp          # Console test harness with crash diagnostics
+├── src/
+│   └── kernel_stubs.cpp           # Legacy kernel stubs (pre-ReXGlue, 205 functions)
+├── tools/
+│   ├── rexglue-sdk/               # ReXGlue SDK (gitignored, built locally)
+│   ├── XenonRecomp/               # Patched XenonRecomp (gitignored)
+│   ├── find_missing_vtable_funcs.py  # Vtable scanner for missing function entries
+│   └── patches/                   # XenonRecomp source patches
+├── extracted/                     # Game files (gitignored, copyrighted)
+├── docs/                          # Technical documentation
+├── screenshot.png                 # Current state screenshot
+├── PROGRESS.md                    # Detailed development log
+└── README.md
+```
 
-- **Vector arithmetic:** `vaddsbs`, `vaddsws`, `vsubsbs`, `vsubshs`, `vsububm`
-- **Vector shifts:** `vslh`, `vsrh`, `vsrah`, `vsrab`, `vrlh`
-- **Vector compare:** `vcmpequh`, `vcmpgtsh`, `vcmpgtsw` (with RC bit)
-- **Vector pack:** `vpkshss`, `vpkswss`, `vpkswus`, `vpkuhus` (and 128-bit variants)
-- **Vector misc:** `vmaxsh`, `vminsh`, `vavguh`, `vspltish`, `vslo`, `vnor`
-- **Float conversion:** `vcfpuxws128` (float -> unsigned int with saturation)
-- **Integer logical:** `eqv` (equivalence)
-- **CR bit ops:** `cror`, `crorc` (condition register OR/OR-complement)
-- **Other:** `cctph` (Cell hint, no-op), `rldicl.` RC bit fix
-- **Bug fixes:** Added missing RC bit (`.` suffix) handling for `vcmpgtub`, `vcmpgtuh`
+## Technical Deep Dive
 
-## Xbox 360 Kernel Stubs
+### The Recompilation Pipeline
 
-The runtime includes 205 stub implementations for Xbox 360 kernel/system imports, organized by subsystem:
+1. **XenonAnalyse** scans the XEX binary, detecting 81 jump tables and mapping the control flow graph
+2. **ReXGlue codegen** translates ~8,000 PowerPC functions into C++ using the config's function boundaries and switch table definitions
+3. **Safe macro overrides** patch the generated code to handle NULL pointers, missing vtable entries, and unimplemented instructions gracefully
+4. The result links against the ReXGlue SDK which provides a full Xbox 360 runtime: kernel (threads, sync, memory, file I/O), GPU (D3D12 command processor, shader translator), audio (XMA decoder), and input (XInput)
 
-| Subsystem | Count | Description |
-|-----------|-------|-------------|
-| Ke* | 25 | Kernel core (threads, sync, TLS, timing) |
-| Nt* | 18 | NT kernel (files, memory, events, timers) |
-| Rtl* | 12 | Runtime library (strings, memory, critical sections) |
-| Vd* | 18 | Video/display (Xenos GPU, ring buffers) |
-| Xam* | 40+ | Xbox Application Manager (UI, profiles, input) |
-| XAudio/XMA | 7 | Audio subsystem |
-| NetDll_* | 25+ | Networking (XNet, Winsock) |
-| Ex* | 10 | Executive (memory pools, threads, locks) |
-| Ob* | 5 | Object manager |
-| Xex* | 5 | XEX loader |
-| Other | 20+ | XUsbcam, Mm*, Hal*, C runtime |
+### Challenges Solved
 
-## Toolchain
+- **30+ missing Altivec/VMX instructions** — Added to XenonRecomp (vector pack, shift, compare, saturating arithmetic)
+- **Indirect call safety** — Xbox 360 C++ vtable dispatch through recompiled code needs NULL checks, range validation, and graceful fallback
+- **20 missing vtable functions** — Static analysis misses functions only called through vtable pointers; discovered via automated scanning of the data section
+- **Cross-function gotos** — Static analysis sometimes splits one function into two; the codegen produces invalid goto-across-functions that must be manually merged
+- **Guest null page handling** — VEH handler intercepts null pointer dereferences in guest memory space, decodes x86-64 instructions, zeros destination registers, and continues execution
+- **Thread priority hints** — Xbox 360's `cctph`/`cctpl`/`cctpm` instructions (hardware thread scheduling hints) need to be treated as no-ops
 
-- [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) - Xbox 360 static recompiler
-- [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) - Xenos GPU shader recompiler (future)
+### Xbox 360 Binary Details
+
+| Property | Value |
+|----------|-------|
+| Title | Vigilante 8 Arcade |
+| Title ID | 0x584108A8 |
+| Format | XEX2 (XBLA) |
+| Base Address | 0x82000000 |
+| Code Size | ~2MB |
+| Image Size | ~5MB (17 PE sections) |
+| Functions | ~8,000 recompiled |
+| Data Files | 38 (.ib/.ibz custom format) |
+| Game Engine | Custom (IsopodEngine) |
+
+## Reusing This Work
+
+This project serves as a reference for static recompilation of other Xbox 360 XBLA titles using the ReXGlue SDK. The approach — XenonRecomp codegen + safe macro overrides + stub implementations for missing APIs — is directly applicable to other games. Key transferable pieces:
+
+- The `PPC_CALL_INDIRECT_FUNC` safe override pattern
+- The `PPC_UNIMPLEMENTED` warn-and-skip override
+- The VEH null page handler for guest memory
+- The vtable scanner (`find_missing_vtable_funcs.py`)
+- The crash diagnostics framework (C++ exception decoding, register dumps)
 
 ## References
 
-- [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp) - Reference project (Sonic Unleashed recomp)
-- [N64: Recompiled](https://github.com/N64Recomp/N64Recomp) - Inspiration for the approach
+- [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) — Xbox 360 static recompiler + ReXGlue SDK
+- [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp) — Sonic Unleashed static recomp (reference project)
+- [Xenia](https://github.com/xenia-project/xenia) — Xbox 360 emulator (GPU/kernel code heritage)
+- [N64: Recompiled](https://github.com/N64Recomp/N64Recomp) — Inspiration for the static recomp approach
 
-## License
+## Legal
 
-This project contains no copyrighted game assets. You must provide your own legally obtained copy of Vigilante 8 Arcade.
+This project contains no copyrighted game assets. You must provide your own legally obtained copy of Vigilante 8 Arcade. This is a clean-room reimplementation of the runtime environment, not a copy of the game.
