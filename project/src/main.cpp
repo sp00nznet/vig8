@@ -27,6 +27,113 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <cstdio>
+#include <csignal>
+#include <cstdlib>
+#include <cstdarg>
+#include <mutex>
+
+static FILE* g_crash_log = nullptr;
+static std::mutex g_crash_mutex;
+
+static void crash_log_write(const char* fmt, ...) {
+    std::lock_guard<std::mutex> lock(g_crash_mutex);
+    if (!g_crash_log) {
+        g_crash_log = fopen("E:\\vig8\\vig8_crash.log", "a");
+        if (!g_crash_log) return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_crash_log, fmt, ap);
+    va_end(ap);
+    fflush(g_crash_log);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
+}
+
+// Redirect stderr to a log file for GUI app crash diagnostics
+static struct StderrRedirect_ {
+    StderrRedirect_() {
+        freopen("E:\\vig8\\vig8_stderr.log", "w", stderr);
+        fprintf(stderr, "[vig8] stderr redirected to log file\n");
+        fflush(stderr);
+        // Also open dedicated crash log
+        g_crash_log = fopen("E:\\vig8\\vig8_crash.log", "w");
+        if (g_crash_log) {
+            fprintf(g_crash_log, "[vig8] Crash log initialized\n");
+            fflush(g_crash_log);
+        }
+        // Set terminate handler for uncaught C++ exceptions
+        std::set_terminate([]() {
+            crash_log_write("\n========== TERMINATE CALLED ==========\n");
+            crash_log_write("Thread: %lu\n", GetCurrentThreadId());
+            try { std::rethrow_exception(std::current_exception()); }
+            catch (const std::exception& e) {
+                crash_log_write("std::exception: %s\n", e.what());
+            }
+            catch (...) {
+                crash_log_write("Unknown exception type\n");
+            }
+            crash_log_write("========================================\n");
+            std::abort();
+        });
+    }
+} g_stderr_redirect_;
+
+// VEH handler: log ALL crashes/exceptions (runs on any thread)
+static LONG CALLBACK CrashVEH(EXCEPTION_POINTERS* ep) {
+    auto* ctx = ep->ContextRecord;
+    auto* rec = ep->ExceptionRecord;
+    // Skip breakpoints and single-step (debugger noise)
+    if (rec->ExceptionCode == EXCEPTION_BREAKPOINT ||
+        rec->ExceptionCode == EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    crash_log_write("\n========== EXCEPTION ==========\n");
+    crash_log_write("Thread: %lu\n", GetCurrentThreadId());
+    crash_log_write("Exception: 0x%08lX at RIP=0x%016llX\n",
+            rec->ExceptionCode, (unsigned long long)ctx->Rip);
+    if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION) {
+        crash_log_write("Access address: 0x%016llX (%s)\n",
+                (unsigned long long)rec->ExceptionInformation[1],
+                rec->ExceptionInformation[0] == 0 ? "READ" : "WRITE");
+    }
+    if (rec->ExceptionCode == 0xE06D7363) {
+        crash_log_write("*** C++ EXCEPTION (throw) ***\n");
+        // Try to extract exception message from MSVC exception info
+        if (rec->NumberParameters >= 3 && rec->ExceptionInformation[0] == 0x19930520) {
+            __try {
+                std::exception* ex = reinterpret_cast<std::exception*>(rec->ExceptionInformation[1]);
+                if (ex) {
+                    crash_log_write("what(): %s\n", ex->what());
+                }
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                crash_log_write("(could not read exception object)\n");
+            }
+        }
+    }
+    crash_log_write("RAX=0x%016llX RBX=0x%016llX RCX=0x%016llX RDX=0x%016llX\n",
+            ctx->Rax, ctx->Rbx, ctx->Rcx, ctx->Rdx);
+    crash_log_write("RSI=0x%016llX RDI=0x%016llX RSP=0x%016llX RBP=0x%016llX\n",
+            ctx->Rsi, ctx->Rdi, ctx->Rsp, ctx->Rbp);
+    crash_log_write("R8 =0x%016llX R9 =0x%016llX R10=0x%016llX R11=0x%016llX\n",
+            ctx->R8, ctx->R9, ctx->R10, ctx->R11);
+    crash_log_write("R12=0x%016llX R13=0x%016llX R14=0x%016llX R15=0x%016llX\n",
+            ctx->R12, ctx->R13, ctx->R14, ctx->R15);
+    __try {
+        crash_log_write("\nStack (RSP):\n");
+        uint64_t* sp = (uint64_t*)ctx->Rsp;
+        for (int i = 0; i < 16; i++) {
+            __try {
+                crash_log_write("  [RSP+%02X] = 0x%016llX\n", i*8, sp[i]);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                crash_log_write("  [RSP+%02X] = <unreadable>\n", i*8);
+            }
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    crash_log_write("================================\n");
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 // VEH handler: catch null page reads in guest memory and return 0
 static LONG CALLBACK NullPageHandler(EXCEPTION_POINTERS* ep) {
@@ -66,7 +173,10 @@ static LONG CALLBACK NullPageHandler(EXCEPTION_POINTERS* ep) {
 }
 
 static struct NullPageGuard_ {
-    NullPageGuard_() { AddVectoredExceptionHandler(1, NullPageHandler); }
+    NullPageGuard_() {
+        AddVectoredExceptionHandler(0, CrashVEH);      // log all exceptions (low priority)
+        AddVectoredExceptionHandler(1, NullPageHandler); // handle null page (high priority)
+    }
 } g_null_page_guard_;
 #endif
 
@@ -183,7 +293,20 @@ public:
             }
 
             module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
-                main_thread->Wait(0, 0, 0, nullptr);
+                try {
+                    main_thread->Wait(0, 0, 0, nullptr);
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "\n========== C++ EXCEPTION ==========\n");
+                    fprintf(stderr, "Thread: %lu\n", GetCurrentThreadId());
+                    fprintf(stderr, "what(): %s\n", e.what());
+                    fprintf(stderr, "====================================\n");
+                    fflush(stderr);
+                } catch (...) {
+                    fprintf(stderr, "\n========== UNKNOWN C++ EXCEPTION ==========\n");
+                    fprintf(stderr, "Thread: %lu\n", GetCurrentThreadId());
+                    fprintf(stderr, "=============================================\n");
+                    fflush(stderr);
+                }
                 REXLOG_INFO("Execution complete");
                 if (!shutting_down_.load(std::memory_order_acquire)) {
                     app_context().CallInUIThread([this]() {

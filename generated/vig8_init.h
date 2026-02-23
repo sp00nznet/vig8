@@ -36,6 +36,16 @@
     _fn(ctx, base); \
 } while(0)
 
+// Override PPC_UNIMPLEMENTED to warn instead of throwing.
+// cctph/cctpl/cctpm are thread priority hints (no-ops on x86-64).
+#undef PPC_UNIMPLEMENTED
+#define PPC_UNIMPLEMENTED(addr, opcode) do { \
+    static int _unimp_count = 0; \
+    if (++_unimp_count <= 5) \
+        fprintf(stderr, "[WARN] Unimplemented PPC instruction '%s' at 0x%08X — treating as no-op\n", \
+                opcode, (uint32_t)(addr)); \
+} while(0)
+
 using namespace rex::runtime::guest;
 
 PPC_EXTERN_IMPORT(sub_82090000);
