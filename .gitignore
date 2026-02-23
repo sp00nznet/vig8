@@ -30,6 +30,16 @@ out/
 
 # Generated recomp output (large, reproducible)
 ppc/
+generated/vig8_recomp.*.cpp
+
+# ReXGlue SDK (large, external dependency)
+tools/rexglue-sdk/
+
+# Build output directories
+project/out/
+
+# Crash logs (debug artifacts)
+crash_log*.txt
 
 # IDE / editor
 .vs/

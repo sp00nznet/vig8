@@ -1870,15 +1870,78 @@ PPC_FUNC(__imp__VdGetSystemCommandBuffer)
     ppc_write_u32(base, ctx.r4.u32, s_cmd_size);
 }
 
+// GPU ring buffer state for fake "instant GPU processing"
+static uint8_t* g_gpu_base = nullptr;
+static uint32_t g_gpu_ring_base = 0;       // PPC addr of ring buffer
+static uint32_t g_gpu_ring_size = 0;       // Size in DWORDs
+static uint32_t g_gpu_wptr_addr = 0;       // PPC addr where game stores write pointer
+static uint32_t g_gpu_rptr_wb_phys = 0;    // Physical addr for read pointer writeback
+static uint32_t g_gpu_rptr_wb_virt = 0;    // Virtual addr for read pointer writeback
+static volatile bool g_gpu_thread_running = false;
+
+// Background thread: sync GPU read pointer to write pointer
+// This makes the game think the GPU instantly processes all commands
+static DWORD WINAPI gpu_sync_thread(LPVOID param)
+{
+    (void)param;
+    fprintf(stderr, "[GPU] Ring buffer sync thread started\n");
+    fprintf(stderr, "[GPU]   wptr_addr=0x%08X, rptr_wb_virt=0x%08X, rptr_wb_phys=0x%08X\n",
+            g_gpu_wptr_addr, g_gpu_rptr_wb_virt, g_gpu_rptr_wb_phys);
+    fflush(stderr);
+    while (g_gpu_thread_running)
+    {
+        if (g_gpu_base && g_gpu_wptr_addr && g_gpu_rptr_wb_virt)
+        {
+            // Read current write pointer (big-endian)
+            uint32_t wptr = ppc_read_u32(g_gpu_base, g_gpu_wptr_addr);
+            // Write it to read pointer writeback (both virtual and physical addresses)
+            ppc_write_u32(g_gpu_base, g_gpu_rptr_wb_virt, wptr);
+            if (g_gpu_rptr_wb_phys && g_gpu_rptr_wb_phys != g_gpu_rptr_wb_virt)
+                ppc_write_u32(g_gpu_base, g_gpu_rptr_wb_phys, wptr);
+        }
+        Sleep(1); // 1ms sync interval
+    }
+    return 0;
+}
+
 PPC_FUNC(__imp__VdInitializeRingBuffer)
 {
     STUB_LOG("VdInitializeRingBuffer");
+    // r3 = ring buffer base, r4 = size (log2 DWORDs), r5 = initial wptr, r6 = wptr addr
+    g_gpu_base = base;
+    g_gpu_ring_base = ctx.r3.u32;
+    g_gpu_ring_size = 1 << ctx.r4.u32;
+    g_gpu_wptr_addr = ctx.r6.u32;
+    fprintf(stderr, "[GPU] Ring buffer: base=0x%08X, size=%u DW, wptr_addr=0x%08X, init_wptr=0x%08X\n",
+            g_gpu_ring_base, g_gpu_ring_size, g_gpu_wptr_addr, ctx.r5.u32);
+    fflush(stderr);
     ctx.r3.u32 = 0;
 }
 
 PPC_FUNC(__imp__VdEnableRingBufferRPtrWriteBack)
 {
     STUB_LOG("VdEnableRingBufferRPtrWriteBack");
+    // r3 = physical address for GPU read pointer writeback
+    g_gpu_rptr_wb_phys = ctx.r3.u32;
+    // Virtual address: on Xbox 360, phys 0x0XXXXXXX maps to virt 0xA0000000 + phys
+    g_gpu_rptr_wb_virt = 0xA0000000 + ctx.r3.u32;
+    fprintf(stderr, "[GPU] Read pointer writeback: phys=0x%08X, virt=0x%08X\n",
+            g_gpu_rptr_wb_phys, g_gpu_rptr_wb_virt);
+    fflush(stderr);
+    // Initialize read pointer to current write pointer
+    if (g_gpu_base && g_gpu_wptr_addr)
+    {
+        uint32_t wptr = ppc_read_u32(g_gpu_base, g_gpu_wptr_addr);
+        ppc_write_u32(g_gpu_base, g_gpu_rptr_wb_virt, wptr);
+        ppc_write_u32(g_gpu_base, g_gpu_rptr_wb_phys, wptr);
+        fprintf(stderr, "[GPU] Initial rptr = wptr = 0x%08X\n", wptr);
+    }
+    // Start background sync thread
+    if (!g_gpu_thread_running)
+    {
+        g_gpu_thread_running = true;
+        CreateThread(nullptr, 0, gpu_sync_thread, nullptr, 0, nullptr);
+    }
 }
 
 PPC_FUNC(__imp__VdSetSystemCommandBufferGpuIdentifierAddress)
