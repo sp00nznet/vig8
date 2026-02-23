@@ -38,6 +38,12 @@ tools/rexglue-sdk/
 # Build output directories
 project/out/
 
+# Launch script (local convenience)
+run.bat
+
+# User settings (per-installation)
+vig8_settings.toml
+
 # Debug screenshots
 whitescreen.png
 
