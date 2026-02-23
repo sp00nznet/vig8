@@ -2,8 +2,14 @@
 
 **Vigilante 8 Arcade** (Xbox 360 / XBLA) running natively on PC via static recompilation. No emulator. No interpreter. Just raw, recompiled C++ running at full speed.
 
+![Gameplay - Oil Fields](gameplay.png)
+*Full 3D gameplay at 90 FPS — vehicles, terrain, weapons, HUD, and sky all rendering via D3D12*
+
+![Gameplay - Combat](gameplay2.png)
+*Vehicular combat with weapon pickups, targeting, and particle effects*
+
 ![Main Menu](screenshot.png)
-*Main menu rendering at 56 FPS via D3D12 — menus, audio, input, and HUD all functional*
+*Main menu at 92 FPS*
 
 ## How It Works
 
@@ -17,7 +23,7 @@ The Xbox 360's Xenos GPU commands are processed by a D3D12 backend (derived from
 
 ## Current Status
 
-The game boots, navigates menus, loads levels, and enters gameplay. Audio plays, controllers work with rumble, and the HUD renders correctly. 3D world rendering is in progress (shaders translating, geometry pipeline active — tuning render state for full scene visibility).
+**The game is playable.** It boots, navigates menus, loads levels, and runs full 3D gameplay at 90 FPS. Vehicles drive, weapons fire, enemies attack, audio plays, controllers work with rumble, and the full 3D world renders — terrain, sky, buildings, vehicles, particles, and HUD.
 
 | What Works | Status |
 |-----------|--------|
@@ -29,7 +35,10 @@ The game boots, navigates menus, loads levels, and enters gameplay. Audio plays,
 | File I/O (38 game data files) | Working |
 | Fiber-based cooperative threading (6 threads) | Working |
 | GPU pipeline (D3D12, shader translation) | Working |
-| 3D world rendering | In Progress |
+| 3D world rendering (terrain, vehicles, sky) | Working |
+| Weapon effects & particles | Working |
+| 79 shaders translated, 58+ pipelines | Working |
+| ~2,800 draw calls / frame, 15 resolves / frame | Working |
 | Multiplayer / networking | Stubbed (returns offline) |
 
 ## Quick Start
@@ -69,9 +78,13 @@ cmake --preset win-amd64
 cmake --build out/build/win-amd64 --config Release
 cd ..
 
-# 7. Run
-project/out/build/win-amd64/Release/vig8.exe extracted/
+# 7. Run (ROV render path required for correct 3D rendering)
+project/out/build/win-amd64/Release/vig8.exe extracted/ --render_target_path_d3d12=rov
 ```
+
+### Important: GPU Render Path
+
+The game requires `--render_target_path_d3d12=rov` for correct 3D world rendering. The default RTV (Render Target View) path has an issue resolving the game's k_2_10_10_10_FLOAT render targets with 4xMSAA — the 3D scene resolves correctly but the intermediate textures appear white during compositing. The ROV (Rasterizer Ordered Views) path uses pixel shader interlock for EDRAM emulation and handles this correctly.
 
 ## Project Structure
 
@@ -100,7 +113,9 @@ vig8/
 │   └── patches/                   # XenonRecomp source patches
 ├── extracted/                     # Game files (gitignored, copyrighted)
 ├── docs/                          # Technical documentation
-├── screenshot.png                 # Current state screenshot
+├── gameplay.png                   # In-game screenshot (Oil Fields level)
+├── gameplay2.png                  # In-game screenshot (combat)
+├── screenshot.png                 # Main menu screenshot
 ├── PROGRESS.md                    # Detailed development log
 └── README.md
 ```
@@ -114,6 +129,18 @@ vig8/
 3. **Safe macro overrides** patch the generated code to handle NULL pointers, missing vtable entries, and unimplemented instructions gracefully
 4. The result links against the ReXGlue SDK which provides a full Xbox 360 runtime: kernel (threads, sync, memory, file I/O), GPU (D3D12 command processor, shader translator), audio (XMA decoder), and input (XInput)
 
+### GPU Pipeline (Per Frame)
+
+During gameplay, the GPU processes ~2,800 draw calls and 15 EDRAM resolve operations per frame:
+
+| Pass | Resolves | Description |
+|------|----------|-------------|
+| Shadow maps | 2 depth resolves | Depth-only renders for shadow casting |
+| 3D scene | 4 color + 4 depth resolves | Main world render (k_2_10_10_10_FLOAT, 4xMSAA) |
+| Post-processing | 3 color resolves | Bloom, downscale passes (k_16_16_16_16_FLOAT, k_8_8_8_8) |
+| Final composite | 1 color resolve | HUD + 3D scene → frontbuffer (k_8_8_8_8, 1280x720) |
+| Presentation | 1 swap | Texture fetch 0 → gamma correction → display |
+
 ### Challenges Solved
 
 - **30+ missing Altivec/VMX instructions** — Added to XenonRecomp (vector pack, shift, compare, saturating arithmetic)
@@ -122,6 +149,7 @@ vig8/
 - **Cross-function gotos** — Static analysis sometimes splits one function into two; the codegen produces invalid goto-across-functions that must be manually merged
 - **Guest null page handling** — VEH handler intercepts null pointer dereferences in guest memory space, decodes x86-64 instructions, zeros destination registers, and continues execution
 - **Thread priority hints** — Xbox 360's `cctph`/`cctpl`/`cctpm` instructions (hardware thread scheduling hints) need to be treated as no-ops
+- **RTV resolve white screen** — The default D3D12 render target path produces white 3D output due to an EDRAM resolve issue with k_2_10_10_10_FLOAT + 4xMSAA; fixed by switching to the ROV (pixel shader interlock) path
 
 ### Xbox 360 Binary Details
 
@@ -146,6 +174,7 @@ This project serves as a reference for static recompilation of other Xbox 360 XB
 - The VEH null page handler for guest memory
 - The vtable scanner (`find_missing_vtable_funcs.py`)
 - The crash diagnostics framework (C++ exception decoding, register dumps)
+- The `--render_target_path_d3d12=rov` workaround for EDRAM resolve issues with float render targets
 
 ## References
 

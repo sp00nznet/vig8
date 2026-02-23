@@ -17,11 +17,11 @@
 | 5f. GPU Init | Ring buffer, EDRAM, render threads, XConfig | DONE |
 | 6. ReXGlue Migration | Migrate from raw XenonRecomp to ReXGlue SDK | DONE |
 | 7. Vtable & Crash Fixes | Fix indirect calls, missing functions, null page | DONE |
-| 8. Graphics | D3D12 GPU pipeline, shader translation | IN PROGRESS |
+| 8. Graphics | D3D12 GPU pipeline, shader translation | DONE |
 | 9. Audio | XMA audio decoding & playback | DONE (via ReXGlue) |
 | 10. Input | Controller input + rumble | DONE (via ReXGlue) |
-| 11. Gameplay | Game loads into rounds, HUD functional | IN PROGRESS |
-| 12. Polish | 3D world rendering, optimizations | NOT STARTED |
+| 11. Gameplay | Game loads into rounds, full 3D rendering | DONE |
+| 12. Polish | Performance, RTV path fix, multiplayer | IN PROGRESS |
 
 ---
 
@@ -395,17 +395,67 @@ VdGetSystemCommandBuffer, VdSwap
 
 ---
 
+### 2026-02-23 - 3D Rendering Fixed: ROV Path Discovery
+
+**Completed:**
+- [x] **ROOT CAUSE: White 3D world was an RTV resolve path issue with k_2_10_10_10_FLOAT + 4xMSAA**
+  - The default RTV (Render Target View) D3D12 path fails to correctly resolve the game's 3D scene render targets
+  - The 3D scene renders to EDRAM in k_2_10_10_10_FLOAT format with 4xMSAA, then resolves to k_16_16_16_16_FLOAT intermediate textures
+  - RTV path produces white output during the compositing pass; HUD (k_8_8_8_8, no MSAA) renders correctly
+  - **Fix:** `--render_target_path_d3d12=rov` — ROV (Rasterizer Ordered Views) path uses pixel shader interlock for EDRAM emulation and handles the resolve correctly
+- [x] **GPU diagnostic instrumentation** added to command_processor.cpp
+  - Per-frame counters: draw calls, resolve operations, resolve failures
+  - Resolve destination logging: src_select, dest_base, dest_format, pitch
+  - Swap texture fetch constant logging (texture fetch 0 = frontbuffer source)
+  - Logging triggers for first N frames and every Nth frame during gameplay
+- [x] **Full GPU pipeline characterized** during gameplay:
+
+| Metric | Menu | Gameplay |
+|--------|------|----------|
+| Draw calls/frame | 4-8 | ~2,800 |
+| Resolves/frame | 1 | 15 |
+| Resolve failures | 0 | 0 |
+
+**Per-Frame Resolve Breakdown (Gameplay):**
+
+| Resolves | Type | Format | Description |
+|----------|------|--------|-------------|
+| 1-2 | Depth (src_select=4) | — | Shadow map depth renders |
+| 3,5,7,9 | Color (src_select=0) | k_2_10_10_10_FLOAT → k_16_16_16_16_FLOAT (fmt 32) | 3D scene color (4xMSAA) |
+| 4,6,8,10 | Depth (src_select=4) | — | 3D scene depth |
+| 11-12 | Color | k_16_16_16_16 (fmt 26) | Bloom / post-processing |
+| 13-14 | Color | k_8_8_8_8 (fmt 6) | Small textures |
+| 15 | Color | k_8_8_8_8 (fmt 6), pitch=1280 | Frontbuffer composite (1280x720) |
+
+- Swap always reads from texture fetch constant 0 → guest physical address 0x1BCA7000 (frontbuffer)
+
+**Hypotheses Eliminated:**
+- `gpu_allow_invalid_fetch_constants` — no invalid fetch constant warnings in GPU log; draws not being skipped
+- Memexport — game uses vf95 instruction but no eM_ (memexport writes)
+- Texture cache coherency — `--d3d12_readback_resolve` did not fix the issue
+- GPU inactivity — confirmed ~2,800 draws and 15 successful resolves per frame
+
+**Game Status — FULLY PLAYABLE:**
+- 3D world renders correctly: terrain, vehicles, sky, buildings, particles
+- Weapon effects and pickups visible
+- Full HUD: minimap with enemy tracking, targeting reticles, health bars
+- Running at ~90 FPS during gameplay
+- 79 shaders translated, 58+ pipelines active
+
+---
+
 ## Next Steps
 
-1. **Fix 3D world rendering** — investigate shader translation, render state, or depth buffer issue causing white background in gameplay
+1. **Investigate RTV path fix** — the default D3D12 RTV resolve path produces white output for k_2_10_10_10_FLOAT + 4xMSAA; ROV workaround is functional but a proper fix would benefit NVIDIA GPUs
 2. **Expand null page handler** — handle additional x86-64 instruction encodings for guest null pointer reads
 3. **Add remaining vtable functions** — 112 library/CRT entries still missing from function table
-4. Contribute instruction patches upstream to XenonRecomp/ReXGlue
+4. **Multiplayer stubs** — currently returns offline; could stub enough for local play
+5. Contribute instruction patches upstream to XenonRecomp/ReXGlue
 
 ---
 
 ## Open Questions
 
 1. ~~What engine does Vigilante 8 Arcade use?~~ Custom engine (IsopodEngine) with .ib/.ibz asset format
-2. Why does 3D scene render white while HUD renders correctly? (same GPU pipeline, different shader/state path)
-3. Are there specific Xenos shader features this game uses that the D3D12 translator doesn't handle?
+2. ~~Why does 3D scene render white while HUD renders correctly?~~ RTV resolve path issue with k_2_10_10_10_FLOAT + 4xMSAA → fixed by ROV path
+3. Is the RTV resolve issue specific to this game's render target format, or a general Xenia-derived bug with k_2_10_10_10_FLOAT?
