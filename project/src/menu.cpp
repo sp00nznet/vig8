@@ -14,10 +14,14 @@
 #include <rex/input/input.h>
 #include <rex/stream.h>
 
+#include <SDL2/SDL_gamecontroller.h>
+#include <SDL2/SDL_joystick.h>
+
 #include <imgui.h>
 
 #include <fstream>
 #include <vector>
+#include <string>
 
 using namespace rex::ui;
 
@@ -31,14 +35,19 @@ static void RightAlignedButtons(float button_width = 80.0f) {
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - button_width * 2 - 8);
 }
 
+// ============================================================================
+// Graphics dialog
+// ============================================================================
+
 class GraphicsDialog : public ImGuiDialog {
 public:
-    GraphicsDialog(ImGuiDrawer* drawer, Window* window,
-                   Vig8Settings* settings,
+    GraphicsDialog(ImGuiDrawer* drawer, WindowedAppContext* app_context,
+                   Window* window, Vig8Settings* settings,
                    const std::filesystem::path& settings_path,
                    std::function<void()> on_done)
-        : ImGuiDialog(drawer), window_(window), settings_(settings),
-          settings_path_(settings_path), on_done_(std::move(on_done)) {
+        : ImGuiDialog(drawer), app_context_(app_context), window_(window),
+          settings_(settings), settings_path_(settings_path),
+          on_done_(std::move(on_done)) {
         render_path_idx_ = (settings->render_path == "rtv") ? 1 : 0;
         resolution_scale_idx_ = (settings->resolution_scale >= 2) ? 1 : 0;
         fullscreen_ = settings->fullscreen;
@@ -63,7 +72,7 @@ protected:
             const char* scale_items[] = {"1x", "2x"};
             ImGui::Combo("##resolution_scale", &resolution_scale_idx_, scale_items, 2);
 
-            ImGui::Checkbox("Fullscreen", &fullscreen_);
+            ImGui::Checkbox("Fullscreen (F11)", &fullscreen_);
 
             ImGui::Spacing();
             ImGui::TextDisabled("Render path and resolution scale require restart.");
@@ -79,8 +88,13 @@ protected:
                 bool fs_changed = (settings_->fullscreen != fullscreen_);
                 settings_->fullscreen = fullscreen_;
                 SaveSettings(settings_path_, *settings_);
-                if (fs_changed && window_) {
-                    window_->SetFullscreen(fullscreen_);
+                // Defer fullscreen change to avoid crash during ImGui draw
+                if (fs_changed && window_ && app_context_) {
+                    bool fs = fullscreen_;
+                    auto* w = window_;
+                    app_context_->CallInUIThreadDeferred([w, fs]() {
+                        w->SetFullscreen(fs);
+                    });
                 }
                 Close();
                 if (on_done_) on_done_();
@@ -95,6 +109,7 @@ protected:
     }
 
 private:
+    WindowedAppContext* app_context_;
     Window* window_;
     Vig8Settings* settings_;
     std::filesystem::path settings_path_;
@@ -103,6 +118,10 @@ private:
     int resolution_scale_idx_ = 0;
     bool fullscreen_ = false;
 };
+
+// ============================================================================
+// Game dialog
+// ============================================================================
 
 class GameDialog : public ImGuiDialog {
 public:
@@ -150,6 +169,10 @@ private:
     bool full_game_ = true;
 };
 
+// ============================================================================
+// Debug dialog
+// ============================================================================
+
 class DebugDialog : public ImGuiDialog {
 public:
     DebugDialog(ImGuiDrawer* drawer, Vig8Settings* settings,
@@ -166,7 +189,7 @@ public:
 protected:
     void OnDraw(ImGuiIO& io) override {
         (void)io;
-        ImGui::SetNextWindowSize(ImVec2(350, 210), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(370, 240), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("Debug Options##vig8", nullptr,
                          ImGuiWindowFlags_NoCollapse |
                          ImGuiWindowFlags_NoResize)) {
@@ -174,7 +197,10 @@ protected:
             ImGui::Checkbox("Show debug console", &show_console_);
             ImGui::Separator();
             ImGui::Checkbox("Player invulnerable", &invulnerable_);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(TODO)");
             ImGui::Checkbox("Unlock all vehicles", &unlock_all_cars_);
+            ImGui::TextDisabled("Vehicle unlock requires restart to take effect.");
 
             ImGui::Spacing();
             ImGui::Separator();
@@ -209,70 +235,117 @@ private:
     bool unlock_all_cars_ = false;
 };
 
+// ============================================================================
+// Controls dialog — physical controller assignment
+// ============================================================================
+
+// Info about a physical SDL game controller
+struct PhysicalController {
+    int device_index;           // SDL device index (for opening/naming)
+    SDL_JoystickID instance_id; // SDL instance ID (for tracking)
+    std::string name;           // Human-readable name
+};
+
+// Enumerate connected SDL game controllers
+static std::vector<PhysicalController> EnumerateControllers() {
+    std::vector<PhysicalController> result;
+    int n = SDL_NumJoysticks();
+    for (int i = 0; i < n; i++) {
+        if (!SDL_IsGameController(i)) continue;
+        PhysicalController pc;
+        pc.device_index = i;
+        pc.instance_id = SDL_JoystickGetDeviceInstanceID(i);
+        const char* name = SDL_GameControllerNameForIndex(i);
+        pc.name = name ? name : "Unknown Controller";
+        result.push_back(std::move(pc));
+    }
+    return result;
+}
+
 class ControlsDialog : public ImGuiDialog {
 public:
-    ControlsDialog(ImGuiDrawer* drawer, rex::Runtime* runtime,
-                   Vig8Settings* settings,
+    ControlsDialog(ImGuiDrawer* drawer, Vig8Settings* settings,
                    const std::filesystem::path& settings_path,
                    std::function<void()> on_done)
-        : ImGuiDialog(drawer), runtime_(runtime), settings_(settings),
+        : ImGuiDialog(drawer), settings_(settings),
           settings_path_(settings_path), on_done_(std::move(on_done)) {
-        slots_[0] = settings->controller_1;
-        slots_[1] = settings->controller_2;
-        slots_[2] = settings->controller_3;
-        slots_[3] = settings->controller_4;
-        for (int i = 0; i < 4; i++) {
-            if (slots_[i] == "keyboard") slot_idx_[i] = 2;
-            else if (slots_[i] == "none") slot_idx_[i] = 1;
-            else slot_idx_[i] = 0;  // "auto"
-        }
+        RefreshControllers();
     }
 
 protected:
     void OnDraw(ImGuiIO& io) override {
         (void)io;
-        ImGui::SetNextWindowSize(ImVec2(420, 230), ImGuiCond_FirstUseEver);
-        if (ImGui::Begin("Controls##vig8", nullptr,
+        ImGui::SetNextWindowSize(ImVec2(520, 280), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Controllers##vig8", nullptr,
                          ImGuiWindowFlags_NoCollapse |
                          ImGuiWindowFlags_NoResize)) {
 
-            // Detect connected controllers
-            bool connected[4] = {};
-            if (runtime_ && runtime_->kernel_state()) {
-                auto* input = runtime_->kernel_state()->input_system();
-                if (input) {
-                    for (int i = 0; i < 4; i++) {
-                        rex::input::X_INPUT_CAPABILITIES caps = {};
-                        connected[i] = (input->GetCapabilities(i, 0, &caps) == 0);
-                    }
-                }
+            if (ImGui::Button("Refresh")) {
+                RefreshControllers();
             }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%d controller(s) detected",
+                                (int)physical_.size());
 
-            if (ImGui::BeginTable("##controllers", 3,
+            ImGui::Spacing();
+
+            if (ImGui::BeginTable("##controllers", 2,
                                   ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_BordersInnerH)) {
-                ImGui::TableSetupColumn("Slot", ImGuiTableColumnFlags_WidthFixed, 100);
-                ImGui::TableSetupColumn("Mode", ImGuiTableColumnFlags_WidthFixed, 160);
-                ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Player Slot",
+                                        ImGuiTableColumnFlags_WidthFixed, 100);
+                ImGui::TableSetupColumn("Assigned Controller",
+                                        ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableHeadersRow();
 
-                const char* mode_items[] = {"Auto", "None", "Keyboard"};
-                for (int i = 0; i < 4; i++) {
+                for (int slot = 0; slot < 4; slot++) {
                     ImGui::TableNextRow();
                     ImGui::TableNextColumn();
-                    ImGui::Text("Controller %d", i + 1);
+                    ImGui::Text("Player %d", slot + 1);
                     ImGui::TableNextColumn();
-                    ImGui::PushID(i);
-                    ImGui::SetNextItemWidth(140);
-                    ImGui::Combo("##mode", &slot_idx_[i], mode_items, 3);
-                    ImGui::PopID();
-                    ImGui::TableNextColumn();
-                    if (connected[i]) {
-                        ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f),
-                                           "Connected");
-                    } else {
-                        ImGui::TextDisabled("---");
+
+                    ImGui::PushID(slot);
+                    ImGui::SetNextItemWidth(-1);
+
+                    // Build combo items: "None", then each physical controller
+                    // Current selection: slot_selection_[slot]
+                    //   0 = None, 1..N = physical controller index+1
+                    const char* preview = "None";
+                    if (slot_selection_[slot] > 0 &&
+                        slot_selection_[slot] <= (int)physical_.size()) {
+                        preview = physical_[slot_selection_[slot] - 1]
+                                      .name.c_str();
                     }
+
+                    if (ImGui::BeginCombo("##ctrl", preview)) {
+                        // "None" option
+                        if (ImGui::Selectable("None",
+                                              slot_selection_[slot] == 0)) {
+                            slot_selection_[slot] = 0;
+                        }
+                        // Each physical controller
+                        for (int j = 0; j < (int)physical_.size(); j++) {
+                            // Mark if already assigned to another slot
+                            bool in_use = false;
+                            for (int k = 0; k < 4; k++) {
+                                if (k != slot &&
+                                    slot_selection_[k] == j + 1) {
+                                    in_use = true;
+                                    break;
+                                }
+                            }
+                            std::string label = physical_[j].name;
+                            if (in_use) label += " (in use)";
+
+                            if (ImGui::Selectable(label.c_str(),
+                                                  slot_selection_[slot] ==
+                                                      j + 1)) {
+                                slot_selection_[slot] = j + 1;
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::PopID();
                 }
                 ImGui::EndTable();
             }
@@ -283,11 +356,7 @@ protected:
 
             RightAlignedButtons();
             if (ImGui::Button("OK", ImVec2(80, 0))) {
-                const char* values[] = {"auto", "none", "keyboard"};
-                settings_->controller_1 = values[slot_idx_[0]];
-                settings_->controller_2 = values[slot_idx_[1]];
-                settings_->controller_3 = values[slot_idx_[2]];
-                settings_->controller_4 = values[slot_idx_[3]];
+                ApplyAssignments();
                 SaveSettings(settings_path_, *settings_);
                 Close();
                 if (on_done_) on_done_();
@@ -302,12 +371,64 @@ protected:
     }
 
 private:
-    rex::Runtime* runtime_;
+    void RefreshControllers() {
+        physical_ = EnumerateControllers();
+
+        // Initialize slot selections from current SDL player index assignments
+        for (int slot = 0; slot < 4; slot++)
+            slot_selection_[slot] = 0;
+
+        for (int j = 0; j < (int)physical_.size(); j++) {
+            auto* gc = SDL_GameControllerFromInstanceID(
+                physical_[j].instance_id);
+            if (gc) {
+                int player = SDL_GameControllerGetPlayerIndex(gc);
+                if (player >= 0 && player < 4) {
+                    slot_selection_[player] = j + 1;
+                }
+            }
+        }
+    }
+
+    void ApplyAssignments() {
+        // First, unassign all controllers (set player index to -1)
+        for (auto& pc : physical_) {
+            auto* gc = SDL_GameControllerFromInstanceID(pc.instance_id);
+            if (gc) {
+                SDL_GameControllerSetPlayerIndex(gc, -1);
+            }
+        }
+
+        // Then assign selected controllers to their slots
+        for (int slot = 0; slot < 4; slot++) {
+            int sel = slot_selection_[slot];
+            if (sel > 0 && sel <= (int)physical_.size()) {
+                auto* gc = SDL_GameControllerFromInstanceID(
+                    physical_[sel - 1].instance_id);
+                if (gc) {
+                    SDL_GameControllerSetPlayerIndex(gc, slot);
+                }
+            }
+        }
+
+        // Save controller names to settings for reference
+        auto get_name = [&](int slot) -> std::string {
+            int sel = slot_selection_[slot];
+            if (sel > 0 && sel <= (int)physical_.size())
+                return physical_[sel - 1].name;
+            return "none";
+        };
+        settings_->controller_1 = get_name(0);
+        settings_->controller_2 = get_name(1);
+        settings_->controller_3 = get_name(2);
+        settings_->controller_4 = get_name(3);
+    }
+
     Vig8Settings* settings_;
     std::filesystem::path settings_path_;
     std::function<void()> on_done_;
-    std::string slots_[4];
-    int slot_idx_[4] = {};
+    std::vector<PhysicalController> physical_;
+    int slot_selection_[4] = {};  // 0=None, 1..N=physical index+1
 };
 
 // ============================================================================
@@ -341,8 +462,8 @@ struct MenuSystem::Impl {
 
     void ShowGraphicsDialog() {
         if (gfx_dialog) return;
-        gfx_dialog = new GraphicsDialog(imgui_drawer, window, settings,
-                                        settings_path,
+        gfx_dialog = new GraphicsDialog(imgui_drawer, app_context, window,
+                                        settings, settings_path,
                                         MakeOnDone(gfx_dialog));
     }
 
@@ -361,7 +482,7 @@ struct MenuSystem::Impl {
     void ShowControlsDialog() {
         if (controls_dialog) return;
         controls_dialog = new ControlsDialog(
-            imgui_drawer, runtime, settings, settings_path,
+            imgui_drawer, settings, settings_path,
             MakeOnDone(controls_dialog, false));
     }
 
@@ -410,35 +531,14 @@ struct MenuSystem::Impl {
     }
 
     void LoadState() {
-        if (!runtime || !runtime->kernel_state()) {
-            ImGuiDialog::ShowMessageBox(imgui_drawer, "Load State",
-                                        "Runtime not available.");
-            return;
-        }
-
-        auto save_path = settings_path.parent_path() / "vig8_savestate.bin";
-        std::ifstream f(save_path, std::ios::binary | std::ios::ate);
-        if (!f) {
-            ImGuiDialog::ShowMessageBox(imgui_drawer, "Load State",
-                                        "No save state file found.");
-            return;
-        }
-
-        auto size = f.tellg();
-        f.seekg(0);
-        std::vector<uint8_t> buffer(size);
-        f.read(reinterpret_cast<char*>(buffer.data()), size);
-        f.close();
-
-        rex::stream::ByteStream stream(buffer.data(), buffer.size());
-        if (!runtime->kernel_state()->Restore(&stream)) {
-            ImGuiDialog::ShowMessageBox(imgui_drawer, "Load State",
-                                        "Failed to restore state.");
-            return;
-        }
-
-        ImGuiDialog::ShowMessageBox(imgui_drawer, "Load State",
-                                    "State restored successfully.");
+        // KernelState::Restore while the game is actively running is unsafe
+        // (it modifies threads, memory, and kernel objects mid-execution).
+        // Show a warning instead of crashing.
+        ImGuiDialog::ShowMessageBox(
+            imgui_drawer, "Load State",
+            "Load state is not yet supported while the game is running.\n\n"
+            "Save states can be created for future use once\n"
+            "a safe restore mechanism is implemented.");
     }
 };
 
@@ -489,7 +589,7 @@ std::unique_ptr<MenuItem> MenuSystem::BuildMenuBar() {
     auto config_menu = MenuItem::Create(MenuItem::Type::kPopup, "Config");
 
     config_menu->AddChild(MenuItem::Create(
-        MenuItem::Type::kString, "Controls...",
+        MenuItem::Type::kString, "Controllers...",
         [ctx]() { ctx->ShowControlsDialog(); }));
 
     config_menu->AddChild(MenuItem::Create(

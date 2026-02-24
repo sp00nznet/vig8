@@ -378,11 +378,6 @@ public:
         window_->AddInputListener(this, 0);
         window_->Open();
 
-        // Apply fullscreen if configured
-        if (settings_.fullscreen) {
-            window_->SetFullscreen(true);
-        }
-
         // Setup graphics presenter and ImGui
         auto* graphics_system = runtime_->graphics_system();
         if (graphics_system && graphics_system->presenter()) {
@@ -415,6 +410,14 @@ public:
                 }
             }
             window_->SetPresenter(presenter);
+        }
+
+        // Apply fullscreen after presenter is fully wired up
+        if (settings_.fullscreen) {
+            auto* w = window_.get();
+            app_context().CallInUIThreadDeferred([w]() {
+                w->SetFullscreen(true);
+            });
         }
 
         // Launch module in background
@@ -499,8 +502,14 @@ public:
     void OnKeyDown(rex::ui::KeyEvent& e) override {
         if (e.virtual_key() == rex::ui::VirtualKey::kF11) {
             settings_.fullscreen = !settings_.fullscreen;
-            window_->SetFullscreen(settings_.fullscreen);
             SaveSettings(settings_path_, settings_);
+            // Defer fullscreen change to next UI frame to avoid
+            // surface/presenter conflicts during event processing
+            bool fs = settings_.fullscreen;
+            auto* w = window_.get();
+            app_context().CallInUIThreadDeferred([w, fs]() {
+                w->SetFullscreen(fs);
+            });
             e.set_handled(true);
         }
     }
