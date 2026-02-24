@@ -30,7 +30,7 @@ The Xbox 360's Xenos GPU commands are processed by a D3D12 backend (derived from
 | Game boot & CRT initialization | Working |
 | Menu navigation & UI | Working |
 | Audio playback (XMA decode) | Working |
-| Controller input + rumble | Working |
+| Controller input + rumble (4 players) | Working |
 | HUD rendering (minimap, targeting, health) | Working |
 | File I/O (38 game data files) | Working |
 | Fiber-based cooperative threading (6 threads) | Working |
@@ -39,7 +39,24 @@ The Xbox 360's Xenos GPU commands are processed by a D3D12 backend (derived from
 | Weapon effects & particles | Working |
 | 79 shaders translated, 58+ pipelines | Working |
 | ~2,800 draw calls / frame, 15 resolves / frame | Working |
+| Settings persistence (TOML config) | Working |
+| Save/Load state (full kernel state) | Working |
+| Fullscreen toggle (F11 hotkey) | Working |
+| Vehicle unlock & debug options | Working |
 | Multiplayer / networking | Stubbed (returns offline) |
+
+### Menu System & Settings
+
+The recompiled build includes a native Win32 menu bar with ImGui configuration dialogs:
+
+- **File** — Save/Load state (full kernel state serialization to `vig8_savestate.bin`)
+- **Config → Graphics** — Render path (ROV/RTV), resolution scale (1x/2x), fullscreen toggle
+- **Config → Controls** — 4-player controller slots (Auto/None/Keyboard) with live connection detection
+- **Config → Game** — Full game unlock (bypass trial mode)
+- **Config → Debug** — FPS overlay, debug console visibility, player invulnerability, unlock all vehicles
+- **Help → About**
+
+Settings persist to `vig8_settings.toml`. Fullscreen can also be toggled with **F11**.
 
 ## Quick Start
 
@@ -78,13 +95,15 @@ cmake --preset win-amd64
 cmake --build out/build/win-amd64 --config Release
 cd ..
 
-# 7. Run (ROV render path required for correct 3D rendering)
-project/out/build/win-amd64/Release/vig8.exe extracted/ --render_target_path_d3d12=rov
+# 7. Run
+project/out/build/win-amd64/Release/vig8.exe extracted/
 ```
+
+The ROV render path is selected by default via `vig8_settings.toml`. All settings (render path, fullscreen, controller config, debug options) are configurable through the in-app Config menu and persist across sessions.
 
 ### Important: GPU Render Path
 
-The game requires `--render_target_path_d3d12=rov` for correct 3D world rendering. The default RTV (Render Target View) path has an issue resolving the game's k_2_10_10_10_FLOAT render targets with 4xMSAA — the 3D scene resolves correctly but the intermediate textures appear white during compositing. The ROV (Rasterizer Ordered Views) path uses pixel shader interlock for EDRAM emulation and handles this correctly.
+The game uses the ROV (Rasterizer Ordered Views) render path by default for correct 3D world rendering. The alternative RTV (Render Target View) path has an issue resolving the game's k_2_10_10_10_FLOAT render targets with 4xMSAA — the 3D scene resolves correctly but the intermediate textures appear white during compositing. The ROV path uses pixel shader interlock for EDRAM emulation and handles this correctly. The render path can be changed in Config → Graphics (requires restart).
 
 ## Project Structure
 
@@ -101,8 +120,10 @@ vig8/
 ├── project/                       # CMake project
 │   ├── CMakeLists.txt             # Build system (links rex::core/runtime/kernel/graphics/ui)
 │   └── src/
-│       ├── main.cpp               # Windowed app, VEH crash handlers, null page handler
-│       ├── stubs.cpp              # Stub implementations for missing kernel APIs
+│       ├── main.cpp               # Windowed app, VEH crash handlers, F11 fullscreen
+│       ├── stubs.cpp              # Stub implementations + vehicle unlock override
+│       ├── menu.cpp/h             # Menu bar + ImGui config dialogs
+│       ├── settings.cpp/h         # TOML settings persistence
 │       └── test_boot.cpp          # Console test harness with crash diagnostics
 ├── src/
 │   └── kernel_stubs.cpp           # Legacy kernel stubs (pre-ReXGlue, 205 functions)

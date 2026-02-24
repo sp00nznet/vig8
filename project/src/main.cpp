@@ -3,6 +3,8 @@
 
 #include "vig8_config.h"
 #include "vig8_init.h"
+#include "settings.h"
+#include "menu.h"
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -11,6 +13,7 @@
 #include <rex/kernel/xthread.h>
 #include <rex/kernel/kernel_state.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/flags.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 #include <rex/ui/windowed_app.h>
@@ -18,6 +21,8 @@
 #include <rex/ui/immediate_drawer.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/imgui_dialog.h>
+#include <rex/ui/ui_event.h>
+#include <rex/ui/virtual_key.h>
 
 #include <imgui.h>
 
@@ -242,12 +247,37 @@ static struct NullPageGuard_ {
 } g_null_page_guard_;
 #endif
 
+static void ApplyConsoleVisibility(bool show) {
+#ifdef _WIN32
+    HWND console = GetConsoleWindow();
+    if (console) {
+        ShowWindow(console, show ? SW_SHOW : SW_HIDE);
+    }
+#endif
+}
+
 class DebugOverlayDialog : public rex::ui::ImGuiDialog {
 public:
+    bool visible = true;
+
     DebugOverlayDialog(rex::ui::ImGuiDrawer* imgui_drawer)
         : ImGuiDialog(imgui_drawer) {}
 protected:
     void OnDraw(ImGuiIO& io) override {
+        // Always call Begin/End to keep the ImGui frame active — returning
+        // early with no ImGui calls causes the drawer to stop requesting
+        // redraws, which stalls the entire render pipeline.
+        if (!visible) {
+            ImGui::SetNextWindowPos(ImVec2(-100, -100));
+            ImGui::SetNextWindowSize(ImVec2(1, 1));
+            ImGui::SetNextWindowBgAlpha(0.0f);
+            ImGui::Begin("Debug##overlay", nullptr,
+                         ImGuiWindowFlags_NoDecoration |
+                         ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_NoBackground);
+            ImGui::End();
+            return;
+        }
         ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(220, 60), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowBgAlpha(0.5f);
@@ -258,7 +288,9 @@ protected:
     }
 };
 
-class Vig8App : public rex::ui::WindowedApp, public rex::ui::WindowListener {
+class Vig8App : public rex::ui::WindowedApp,
+                public rex::ui::WindowListener,
+                public rex::ui::WindowInputListener {
 public:
     static std::unique_ptr<rex::ui::WindowedApp> Create(rex::ui::WindowedAppContext& ctx) {
         return std::make_unique<Vig8App>(ctx);
@@ -279,6 +311,26 @@ public:
         } else {
             game_dir = exe_dir / "assets";
         }
+
+        // Load user settings from vig8_settings.toml
+        settings_path_ = std::filesystem::absolute(game_dir).parent_path()
+                          / "vig8_settings.toml";
+        settings_ = LoadSettings(settings_path_);
+
+        // Apply render path from settings (before runtime init)
+        rex::cvar::SetFlagByName("render_target_path_d3d12",
+                                 settings_.render_path);
+
+        // Apply resolution scale CVars
+        REXCVAR_SET(draw_resolution_scale_x, settings_.resolution_scale);
+        REXCVAR_SET(draw_resolution_scale_y, settings_.resolution_scale);
+
+        // Apply debug flags
+        g_vig8_invulnerable = settings_.invulnerable;
+        g_vig8_unlock_all_cars = settings_.unlock_all_cars;
+
+        // Hide console on startup if configured
+        ApplyConsoleVisibility(settings_.show_console);
 
         std::string log_file_cvar = REXCVAR_GET(log_file);
         std::string log_level_str = REXCVAR_GET(log_level);
@@ -323,7 +375,13 @@ public:
         }
 
         window_->AddListener(this);
+        window_->AddInputListener(this, 0);
         window_->Open();
+
+        // Apply fullscreen if configured
+        if (settings_.fullscreen) {
+            window_->SetFullscreen(true);
+        }
 
         // Setup graphics presenter and ImGui
         auto* graphics_system = runtime_->graphics_system();
@@ -336,8 +394,22 @@ public:
                     immediate_drawer_->SetPresenter(presenter);
                     imgui_drawer_ = std::make_unique<rex::ui::ImGuiDrawer>(window_.get(), 64);
                     imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, immediate_drawer_.get());
+
+                    // Debug FPS overlay (visibility controlled by settings)
                     debug_overlay_ = std::unique_ptr<DebugOverlayDialog>(
                         new DebugOverlayDialog(imgui_drawer_.get()));
+                    debug_overlay_->visible = settings_.show_fps;
+
+                    // Menu system with config dialogs
+                    menu_system_ = std::make_unique<MenuSystem>(
+                        imgui_drawer_.get(), window_.get(), &app_context(),
+                        runtime_.get(),
+                        &settings_, settings_path_,
+                        [this]() { ApplySettings(); });
+                    auto menu = menu_system_->BuildMenuBar();
+                    window_->SetMainMenu(std::move(menu));
+                    window_->CompleteMainMenuItemsUpdate();
+
                     runtime_->set_display_window(window_.get());
                     runtime_->set_imgui_drawer(imgui_drawer_.get());
                 }
@@ -392,6 +464,8 @@ public:
     }
 
     void OnDestroy() override {
+        // Menu/dialog cleanup (before drawer)
+        menu_system_.reset();
         // ImGui cleanup (reverse of setup)
         debug_overlay_.reset();
         if (imgui_drawer_) {
@@ -414,13 +488,49 @@ public:
             module_thread_.join();
         }
         if (window_) {
+            window_->RemoveInputListener(this);
             window_->RemoveListener(this);
         }
         window_.reset();
         runtime_.reset();
     }
 
+    // WindowInputListener: F11 toggles fullscreen
+    void OnKeyDown(rex::ui::KeyEvent& e) override {
+        if (e.virtual_key() == rex::ui::VirtualKey::kF11) {
+            settings_.fullscreen = !settings_.fullscreen;
+            window_->SetFullscreen(settings_.fullscreen);
+            SaveSettings(settings_path_, settings_);
+            e.set_handled(true);
+        }
+    }
+
 private:
+    // Called when settings are changed via a config dialog
+    void ApplySettings() {
+        // Debug overlay visibility
+        if (debug_overlay_) {
+            debug_overlay_->visible = settings_.show_fps;
+        }
+
+        // Debug console visibility
+        ApplyConsoleVisibility(settings_.show_console);
+
+        // Debug flags
+        g_vig8_invulnerable = settings_.invulnerable;
+        g_vig8_unlock_all_cars = settings_.unlock_all_cars;
+
+        // Render path changes require restart (just saved to file)
+        REXLOG_INFO("Settings applied (render_path={}, show_fps={}, full_game={}, "
+                    "show_console={}, invulnerable={}, unlock_all_cars={})",
+                    settings_.render_path,
+                    settings_.show_fps ? "true" : "false",
+                    settings_.full_game ? "true" : "false",
+                    settings_.show_console ? "true" : "false",
+                    settings_.invulnerable ? "true" : "false",
+                    settings_.unlock_all_cars ? "true" : "false");
+    }
+
     std::unique_ptr<rex::Runtime> runtime_;
     std::unique_ptr<rex::ui::Window> window_;
     std::thread module_thread_;
@@ -428,6 +538,9 @@ private:
     std::unique_ptr<rex::ui::ImmediateDrawer> immediate_drawer_;
     std::unique_ptr<rex::ui::ImGuiDrawer> imgui_drawer_;
     std::unique_ptr<DebugOverlayDialog> debug_overlay_;
+    std::unique_ptr<MenuSystem> menu_system_;
+    Vig8Settings settings_;
+    std::filesystem::path settings_path_;
 };
 
 XE_DEFINE_WINDOWED_APP(vig8, Vig8App::Create)

@@ -44,8 +44,9 @@ run.bat
 # User settings (per-installation)
 vig8_settings.toml
 
-# Debug screenshots
+# Debug screenshots / reference images
 whitescreen.png
+menu.png
 
 # Crash logs (debug artifacts)
 crash_log*.txt

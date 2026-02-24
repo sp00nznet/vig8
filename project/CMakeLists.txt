@@ -32,6 +32,8 @@ if(WIN32)
     add_executable(vig8 WIN32
         src/main.cpp
         src/stubs.cpp
+        src/settings.cpp
+        src/menu.cpp
         ${ENTRY_POINT_SRC}
         ${GENERATED_SOURCES}
     )
@@ -39,6 +41,8 @@ else()
     add_executable(vig8
         src/main.cpp
         src/stubs.cpp
+        src/settings.cpp
+        src/menu.cpp
         ${ENTRY_POINT_SRC}
         ${GENERATED_SOURCES}
     )
