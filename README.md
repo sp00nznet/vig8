@@ -47,7 +47,7 @@ The Xbox 360's Xenos GPU commands are processed by a D3D12 backend (derived from
 | Fullscreen toggle (F11 hotkey) | Working |
 | Vehicle unlock & debug options | Working |
 | Local multiplayer (split-screen) | Working |
-| Online multiplayer / networking | Stubbed (returns offline) |
+| LAN multiplayer (system link) | In progress (networking wired up, needs testing) |
 
 ### Menu System & Settings
 
@@ -126,6 +126,7 @@ vig8/
 │   └── src/
 │       ├── main.cpp               # Windowed app, VEH crash handlers, F11 fullscreen
 │       ├── stubs.cpp              # Stub implementations + vehicle unlock override
+│       ├── net.cpp/h              # LAN multiplayer networking (XNet/QoS overrides)
 │       ├── menu.cpp/h             # Menu bar + ImGui config dialogs
 │       ├── settings.cpp/h         # TOML settings persistence
 │       └── test_boot.cpp          # Console test harness with crash diagnostics
