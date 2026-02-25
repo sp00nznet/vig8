@@ -11,6 +11,9 @@
 ![Main Menu](images/screenshot.png)
 *Main menu at 92 FPS*
 
+![Split Screen](images/splitscreen.png)
+*Local split-screen multiplayer*
+
 ## How It Works
 
 Instead of emulating a PowerPC CPU instruction-by-instruction at runtime, this project translates the **entire Xbox 360 binary** into equivalent C++ source code ahead of time. The result: **1.8 million lines of generated C++** across 49 files that compile into a native x86-64 executable. The game logic runs at full speed because it IS native code — no JIT, no interpreter, no CPU emulation overhead.
@@ -43,7 +46,8 @@ The Xbox 360's Xenos GPU commands are processed by a D3D12 backend (derived from
 | Save/Load state (full kernel state) | Working |
 | Fullscreen toggle (F11 hotkey) | Working |
 | Vehicle unlock & debug options | Working |
-| Multiplayer / networking | Stubbed (returns offline) |
+| Local multiplayer (split-screen) | Working |
+| Online multiplayer / networking | Stubbed (returns offline) |
 
 ### Menu System & Settings
 

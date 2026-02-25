@@ -21,6 +21,10 @@ struct Vig8Settings {
     std::string controller_2 = "none";
     std::string controller_3 = "none";
     std::string controller_4 = "none";
+    // Per-slot sign-in: player 1 always connected, others opt-in
+    bool connected_2 = false;
+    bool connected_3 = false;
+    bool connected_4 = false;
 
     // [debug]
     bool show_fps = true;
@@ -32,6 +36,10 @@ struct Vig8Settings {
 // Global debug flags (defined in stubs.cpp, set from ApplySettings)
 extern bool g_vig8_invulnerable;
 extern bool g_vig8_unlock_all_cars;
+
+// Per-slot sign-in state (defined in stubs.cpp, set from ApplySettings)
+// Player 1 is always connected; slots 1-3 controlled by settings.
+extern bool g_vig8_user_connected[4];
 
 // Load settings from TOML file. Returns defaults if file doesn't exist or fails to parse.
 Vig8Settings LoadSettings(const std::filesystem::path& path);

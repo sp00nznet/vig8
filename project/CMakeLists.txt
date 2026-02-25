@@ -75,6 +75,14 @@ if(NOT MSVC)
     target_compile_options(vig8 PRIVATE -msse4.1)
 endif()
 
+# Allow our stubs.cpp to override XAM user functions from rexkernel.lib.
+# xam_user.cpp.obj gets pulled in for functions we still need (e.g.
+# XamUserReadProfileSettings), so /force:multiple lets our definitions
+# take precedence over the library's.
+if(WIN32)
+    target_link_options(vig8 PRIVATE "LINKER:/force:multiple")
+endif()
+
 # Console test executable (no GUI)
 add_executable(vig8_test
     src/test_boot.cpp
@@ -100,6 +108,10 @@ target_compile_options(vig8_test PRIVATE
 )
 if(NOT MSVC)
     target_compile_options(vig8_test PRIVATE -msse4.1)
+endif()
+
+if(WIN32)
+    target_link_options(vig8_test PRIVATE "LINKER:/force:multiple")
 endif()
 
 # Whole-archive link for kernel hooks on Linux

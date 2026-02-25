@@ -529,6 +529,12 @@ private:
         g_vig8_invulnerable = settings_.invulnerable;
         g_vig8_unlock_all_cars = settings_.unlock_all_cars;
 
+        // Multi-user sign-in state
+        g_vig8_user_connected[0] = true;
+        g_vig8_user_connected[1] = settings_.connected_2;
+        g_vig8_user_connected[2] = settings_.connected_3;
+        g_vig8_user_connected[3] = settings_.connected_4;
+
         // Render path changes require restart (just saved to file)
         REXLOG_INFO("Settings applied (render_path={}, show_fps={}, full_game={}, "
                     "show_console={}, invulnerable={}, unlock_all_cars={})",

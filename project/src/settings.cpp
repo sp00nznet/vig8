@@ -25,6 +25,9 @@ Vig8Settings LoadSettings(const std::filesystem::path& path) {
         s.controller_2 = tbl["controls"]["controller_2"].value_or(s.controller_2);
         s.controller_3 = tbl["controls"]["controller_3"].value_or(s.controller_3);
         s.controller_4 = tbl["controls"]["controller_4"].value_or(s.controller_4);
+        s.connected_2 = tbl["controls"]["connected_2"].value_or(s.connected_2);
+        s.connected_3 = tbl["controls"]["connected_3"].value_or(s.connected_3);
+        s.connected_4 = tbl["controls"]["connected_4"].value_or(s.connected_4);
 
         // [debug]
         s.show_fps = tbl["debug"]["show_fps"].value_or(s.show_fps);
@@ -57,6 +60,9 @@ void SaveSettings(const std::filesystem::path& path, const Vig8Settings& s) {
     f << "controller_2 = " << toml::value<std::string>(s.controller_2) << "\n";
     f << "controller_3 = " << toml::value<std::string>(s.controller_3) << "\n";
     f << "controller_4 = " << toml::value<std::string>(s.controller_4) << "\n";
+    f << "connected_2 = " << (s.connected_2 ? "true" : "false") << "\n";
+    f << "connected_3 = " << (s.connected_3 ? "true" : "false") << "\n";
+    f << "connected_4 = " << (s.connected_4 ? "true" : "false") << "\n";
     f << "\n";
 
     f << "[debug]\n";

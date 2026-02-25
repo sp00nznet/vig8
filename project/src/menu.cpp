@@ -269,13 +269,17 @@ public:
                    std::function<void()> on_done)
         : ImGuiDialog(drawer), settings_(settings),
           settings_path_(settings_path), on_done_(std::move(on_done)) {
+        connected_[0] = true;  // Player 1 always connected
+        connected_[1] = settings->connected_2;
+        connected_[2] = settings->connected_3;
+        connected_[3] = settings->connected_4;
         RefreshControllers();
     }
 
 protected:
     void OnDraw(ImGuiIO& io) override {
         (void)io;
-        ImGui::SetNextWindowSize(ImVec2(520, 280), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(590, 280), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("Controllers##vig8", nullptr,
                          ImGuiWindowFlags_NoCollapse |
                          ImGuiWindowFlags_NoResize)) {
@@ -289,11 +293,13 @@ protected:
 
             ImGui::Spacing();
 
-            if (ImGui::BeginTable("##controllers", 2,
+            if (ImGui::BeginTable("##controllers", 3,
                                   ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_BordersInnerH)) {
                 ImGui::TableSetupColumn("Player Slot",
                                         ImGuiTableColumnFlags_WidthFixed, 100);
+                ImGui::TableSetupColumn("Connected",
+                                        ImGuiTableColumnFlags_WidthFixed, 70);
                 ImGui::TableSetupColumn("Assigned Controller",
                                         ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableHeadersRow();
@@ -302,6 +308,19 @@ protected:
                     ImGui::TableNextRow();
                     ImGui::TableNextColumn();
                     ImGui::Text("Player %d", slot + 1);
+
+                    // Connected checkbox (Player 1 always on)
+                    ImGui::TableNextColumn();
+                    ImGui::PushID(slot + 100);
+                    if (slot == 0) {
+                        bool always_on = true;
+                        ImGui::BeginDisabled();
+                        ImGui::Checkbox("##conn", &always_on);
+                        ImGui::EndDisabled();
+                    } else {
+                        ImGui::Checkbox("##conn", &connected_[slot]);
+                    }
+                    ImGui::PopID();
                     ImGui::TableNextColumn();
 
                     ImGui::PushID(slot);
@@ -422,6 +441,24 @@ private:
         settings_->controller_2 = get_name(1);
         settings_->controller_3 = get_name(2);
         settings_->controller_4 = get_name(3);
+
+        // Save connected state and update sign-in globals
+        settings_->connected_2 = connected_[1];
+        settings_->connected_3 = connected_[2];
+        settings_->connected_4 = connected_[3];
+        g_vig8_user_connected[0] = true;
+        g_vig8_user_connected[1] = connected_[1];
+        g_vig8_user_connected[2] = connected_[2];
+        g_vig8_user_connected[3] = connected_[3];
+
+        // Notify the game that sign-in state changed so it re-queries
+        auto* ks = rex::kernel::kernel_state();
+        if (ks) {
+            uint32_t mask = 0;
+            for (int i = 0; i < 4; i++)
+                if (g_vig8_user_connected[i]) mask |= (1u << i);
+            ks->BroadcastNotification(0x0000000A, mask);  // XN_SYS_SIGNINCHANGED
+        }
     }
 
     Vig8Settings* settings_;
@@ -429,6 +466,7 @@ private:
     std::function<void()> on_done_;
     std::vector<PhysicalController> physical_;
     int slot_selection_[4] = {};  // 0=None, 1..N=physical index+1
+    bool connected_[4] = {true, false, false, false};
 };
 
 // ============================================================================
