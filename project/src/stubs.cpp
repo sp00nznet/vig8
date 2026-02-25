@@ -24,12 +24,9 @@ bool g_vig8_user_connected[4] = {true, false, false, false};
 
 #define VIG8_STUB(name) VIG8_STUB_RETURN(name, 0)
 
-// Networking stubs (NetDll_*)
-VIG8_STUB(__imp__NetDll_XNetUnregisterInAddr)
-VIG8_STUB(__imp__NetDll_XNetConnect)
-VIG8_STUB(__imp__NetDll_XNetGetConnectStatus)
-VIG8_STUB(__imp__NetDll_XNetQosLookup)
-VIG8_STUB(__imp__NetDll_WSAGetOverlappedResult)
+// Networking overrides moved to net.cpp:
+//   XNetUnregisterInAddr, XNetConnect, XNetGetConnectStatus,
+//   XNetQosLookup, WSAGetOverlappedResult, and others.
 
 // XAM UI stubs
 VIG8_STUB(__imp__XamShowGamerCardUIForXUID)

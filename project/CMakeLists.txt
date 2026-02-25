@@ -34,6 +34,7 @@ if(WIN32)
         src/stubs.cpp
         src/settings.cpp
         src/menu.cpp
+        src/net.cpp
         ${ENTRY_POINT_SRC}
         ${GENERATED_SOURCES}
     )
@@ -43,6 +44,7 @@ else()
         src/stubs.cpp
         src/settings.cpp
         src/menu.cpp
+        src/net.cpp
         ${ENTRY_POINT_SRC}
         ${GENERATED_SOURCES}
     )
@@ -87,6 +89,7 @@ endif()
 add_executable(vig8_test
     src/test_boot.cpp
     src/stubs.cpp
+    src/net.cpp
     ${GENERATED_SOURCES}
 )
 target_include_directories(vig8_test PRIVATE

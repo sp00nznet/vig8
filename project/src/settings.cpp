@@ -29,6 +29,9 @@ Vig8Settings LoadSettings(const std::filesystem::path& path) {
         s.connected_3 = tbl["controls"]["connected_3"].value_or(s.connected_3);
         s.connected_4 = tbl["controls"]["connected_4"].value_or(s.connected_4);
 
+        // [network]
+        s.lan_port = tbl["network"]["lan_port"].value_or(s.lan_port);
+
         // [debug]
         s.show_fps = tbl["debug"]["show_fps"].value_or(s.show_fps);
         s.show_console = tbl["debug"]["show_console"].value_or(s.show_console);
@@ -63,6 +66,10 @@ void SaveSettings(const std::filesystem::path& path, const Vig8Settings& s) {
     f << "connected_2 = " << (s.connected_2 ? "true" : "false") << "\n";
     f << "connected_3 = " << (s.connected_3 ? "true" : "false") << "\n";
     f << "connected_4 = " << (s.connected_4 ? "true" : "false") << "\n";
+    f << "\n";
+
+    f << "[network]\n";
+    f << "lan_port = " << s.lan_port << "\n";
     f << "\n";
 
     f << "[debug]\n";

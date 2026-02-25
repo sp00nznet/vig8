@@ -26,6 +26,9 @@ struct Vig8Settings {
     bool connected_3 = false;
     bool connected_4 = false;
 
+    // [network]
+    int lan_port = 3074;  // UDP port for LAN discovery/QoS beacons
+
     // [debug]
     bool show_fps = true;
     bool show_console = false;

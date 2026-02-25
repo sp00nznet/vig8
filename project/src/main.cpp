@@ -5,6 +5,7 @@
 #include "vig8_init.h"
 #include "settings.h"
 #include "menu.h"
+#include "net.h"
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -420,6 +421,9 @@ public:
             });
         }
 
+        // Initialize LAN networking (after runtime so kernel_state is available)
+        NetInit(settings_.lan_port);
+
         // Launch module in background
         app_context().CallInUIThreadDeferred([this]() {
             auto main_thread = runtime_->LaunchModule();
@@ -494,6 +498,9 @@ public:
             window_->RemoveInputListener(this);
             window_->RemoveListener(this);
         }
+        // Shut down LAN networking before runtime is destroyed
+        NetShutdown();
+
         window_.reset();
         runtime_.reset();
     }
