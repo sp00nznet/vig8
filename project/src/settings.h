@@ -27,7 +27,10 @@ struct Vig8Settings {
     bool connected_4 = false;
 
     // [network]
-    int lan_port = 3074;  // UDP port for LAN discovery/QoS beacons
+    int lan_port = 3074;         // UDP port for LAN discovery/QoS beacons
+    bool relay_enabled = false;  // Connect to xlive relay server
+    std::string relay_host = "localhost";
+    int relay_port = 36000;
 
     // [debug]
     bool show_fps = true;

@@ -12,6 +12,7 @@
 
 #include "net.h"
 #include "vig8_config.h"
+#include "xlive.h"
 
 #include <rex/runtime/guest/context.h>
 #include <rex/runtime/guest/memory.h>
@@ -19,8 +20,11 @@
 #include <rex/kernel/xsocket.h>
 #include <rex/logging.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
@@ -73,10 +77,41 @@ struct QosListenerState {
 static QosListenerState g_qos_listener = {};
 static std::mutex       g_qos_mutex;
 
+// Guest memory base — stored from the first PPC_FUNC call so the discovery
+// thread can write to guest memory for deferred QoS completion.
+static uint8_t* g_base = nullptr;
+
+// Deferred QoS completion: when XNetQosLookup finds sessions it writes
+// cxnqosPending = N (pending) and schedules a completion here.  The
+// discovery thread sets cxnqosPending = 0 after a short delay, giving the
+// game time to finish initialising the session struct (specifically r31+8,
+// the completion-callback object) before we trigger the callback path.
+struct PendingQosCompletion {
+    uint32_t qos_addr;  // guest address of XNQOS struct
+    std::chrono::steady_clock::time_point ready_at;
+};
+static std::vector<PendingQosCompletion> g_pending_qos;
+static std::mutex                        g_pending_qos_mutex;
+
 // Discovery thread
 static SOCKET             g_disc_socket = (SOCKET)INVALID_SOCKET;
 static std::thread        g_disc_thread;
 static std::atomic<bool>  g_disc_running{false};
+
+// Step tracker for crash diagnostics: updated at each major step in DiscoveryThreadFunc
+// so the crash handler can report exactly where the thread was.
+std::atomic<int> g_disc_step{0};
+
+// Pending overlapped completions — for XGI SEARCH we delay the completion
+// so the game has time to store the callback object at overlapped+8 before
+// sub_8218A068 tries to dereference it.
+struct PendingOverlappedCompletion {
+    uint32_t overlapped_ptr;
+    uint32_t result;
+    std::chrono::steady_clock::time_point fire_at;
+};
+static std::vector<PendingOverlappedCompletion> g_pending_ov;
+static std::mutex                               g_pending_ov_mutex;
 
 // Pending async recv operations
 struct PendingRecv {
@@ -93,6 +128,316 @@ static std::mutex g_pending_mutex;
 
 // System-link port (game-set via XNetSetSystemLinkPort)
 static uint16_t g_system_link_port = 0;
+
+// ============================================================================
+// XGI session intercept — overrides __imp__XMsgStartIORequest to handle
+// session create/search/delete via xlive relay.
+//
+// The SDK's XgiApp is already registered at app_id=251 and handles many XGI
+// messages. We cannot replace it via RegisterApp (key already exists in map).
+// Instead we override the XMsgStartIORequest PPC import directly. For session
+// messages we care about we handle them ourselves; everything else is forwarded
+// to the AppManager as normal.
+//
+// Message IDs (determined from vig8_recomp.9.cpp PPC disassembly):
+//   0x000B0010  XGISessionCreateImpl  (28 bytes) — host creates a session
+//   0x000B001C  XGISessionSearch      (36 bytes) — search for sessions
+//   0x000B0011  XGISessionDelete      (16 bytes) — delete/end session
+//   0x000B0012  XGISessionJoinRemote  (20 bytes) — join from search result
+// ============================================================================
+
+// V8 Arcade title ID
+static constexpr uint32_t VIG8_TITLE_ID = 0x584109A8;
+
+// Currently hosted session XNKID
+static uint8_t  g_session_xnkid[8] = {};
+static bool     g_session_active   = false;
+static std::mutex g_session_mutex;
+
+// Forward declaration (defined below in peer-table section)
+static void AddOrUpdatePeer(const XNADDR_LAN& addr, const uint8_t* xnkid);
+
+// Big-endian read/write helpers for guest memory
+static inline uint32_t GuestReadU32(uint8_t* base, uint32_t addr) {
+    uint32_t v;
+    std::memcpy(&v, base + addr, 4);
+    return ((v & 0xFF000000u) >> 24) | ((v & 0x00FF0000u) >> 8)
+         | ((v & 0x0000FF00u) << 8)  | ((v & 0x000000FFu) << 24);
+}
+static inline void GuestWriteU32(uint8_t* base, uint32_t addr, uint32_t val) {
+    uint32_t be = ((val & 0xFF000000u) >> 24) | ((val & 0x00FF0000u) >> 8)
+                | ((val & 0x0000FF00u) << 8)  | ((val & 0x000000FFu) << 24);
+    std::memcpy(base + addr, &be, 4);
+}
+
+// ---- XGISessionCreateImpl (0x000B0010, 28 bytes) ----
+// Buffer layout (from XgiApp.cpp + vig8_recomp.9.cpp disasm):
+//   [0x00] session_ptr        (IN  — XamSessionRefObjByHandle result)
+//   [0x04] flags              (IN)
+//   [0x08] num_public_slots   (IN)
+//   [0x0C] num_private_slots  (IN)
+//   [0x10] user_xuid          (IN)
+//   [0x14] session_info_ptr   (OUT — write XNKID(8)+XNADDR(36) here)
+//   [0x18] nonce_ptr          (IN)
+static rex::X_HRESULT HandleXgiCreate(uint8_t* base, uint32_t buf, uint32_t len) {
+    if (!buf || len < 0x14 + 4) {
+        REXLOG_WARN("[XGI] CREATE: buffer too small (len={})", len);
+        fprintf(stderr, "[XGI] CREATE: buffer too small (len=%u)\n", len);
+        fflush(stderr);
+        return 0x80004005;
+    }
+    uint32_t session_info_ptr = GuestReadU32(base, buf + 0x14);
+    uint32_t num_public = GuestReadU32(base, buf + 0x08);
+    REXLOG_INFO("[XGI] CREATE session_info_ptr=0x{:08X} pub_slots={}", session_info_ptr, num_public);
+    fprintf(stderr, "[XGI] CREATE session_info_ptr=0x%08X pub_slots=%u\n", session_info_ptr, num_public);
+    fflush(stderr);
+
+    // Generate XNKID from local IP + time
+    uint8_t xnkid[8];
+    uint32_t seed = g_local_ip_net ^ (uint32_t)std::time(nullptr);
+    for (int i = 0; i < 8; i++) {
+        seed = seed * 1664525u + 1013904223u;
+        xnkid[i] = (uint8_t)(seed >> 24);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_session_mutex);
+        std::memcpy(g_session_xnkid, xnkid, 8);
+        g_session_active = true;
+    }
+
+    // Write XSESSION_INFO = XNKID(8) + XNADDR(36)
+    if (session_info_ptr) {
+        std::memcpy(base + session_info_ptr,      xnkid,           8);
+        std::memcpy(base + session_info_ptr + 8,  &g_local_xnaddr, sizeof(XNADDR_LAN));
+    }
+
+    if (xlive::IsConnected()) {
+        xlive::RegisterSession(xnkid, nullptr, 0, (uint8_t)num_public);
+        fprintf(stderr, "[XGI] CREATE: registered session with relay\n");
+    } else {
+        fprintf(stderr, "[XGI] CREATE: relay not connected, session is LAN-only\n");
+    }
+    fflush(stderr);
+
+    REXLOG_INFO("[XGI] CREATE ok xnkid={:02X}{:02X}{:02X}{:02X}...",
+                xnkid[0], xnkid[1], xnkid[2], xnkid[3]);
+    return 0;
+}
+
+// ---- XGISessionSearch (0x000B001C, 36 bytes) ----
+// Buffer layout (from vig8_recomp.9.cpp line ~49340):
+//   [0x00] user_index          (IN)
+//   [0x04] search_filter_id    (IN)
+//   [0x08] max_results         (IN — max sessions to return)
+//   [0x0C] num_properties      (IN — uint16)
+//   [0x0E] num_contexts        (IN — uint16)
+//   [0x10] properties_ptr      (IN)
+//   [0x14] contexts_ptr        (IN)
+//   [0x18] buf_size            (IN — size of output buffer in bytes)
+//   [0x1C] output_buf_ptr      (IN — pointer to output buffer)
+//   [0x20] ???
+//
+// Output buffer layout (at output_buf_ptr):
+//   [0]    count of results found  (uint32 big-endian)
+//   [4]    reserved (zeroed)
+//   [8 + i*1326]  XSESSION_SEARCHRESULT entry i
+//
+// XSESSION_SEARCHRESULT (base 64 bytes, padded to 1326 with property data):
+//   [0..7]  XNKID
+//   [8..43] XNADDR
+//   [44]    cOpenPublicSlots
+//   [45]    cOpenPrivateSlots
+//   [46]    cFilledPublicSlots
+//   [47]    cFilledPrivateSlots
+//   [48..63] dwNumProperties, dwNumContexts, pProperties, pContexts (all 0)
+static rex::X_HRESULT HandleXgiSearch(uint8_t* base, uint32_t buf, uint32_t len) {
+    if (!buf || len < 0x20) {
+        REXLOG_WARN("[XGI] SEARCH: buffer too small (len={})", len);
+        return 0x80004005;
+    }
+    uint32_t max_results  = GuestReadU32(base, buf + 0x08);
+    uint32_t buf_size     = GuestReadU32(base, buf + 0x18);
+    uint32_t output_ptr   = GuestReadU32(base, buf + 0x1C);
+
+    REXLOG_INFO("[XGI] SEARCH max={} buf_size={} output=0x{:08X}",
+                max_results, buf_size, output_ptr);
+    fprintf(stderr, "[XGI] SEARCH max=%u buf_size=%u output=0x%08X relay=%s\n",
+            max_results, buf_size, output_ptr,
+            xlive::IsConnected() ? "connected" : "NOT CONNECTED");
+    fflush(stderr);
+
+    // Log all buffer dwords for debugging
+    for (int i = 0; i < 9; i++) {
+        REXLOG_INFO("[XGI] SEARCH buf[{}]=0x{:08X}", i*4, GuestReadU32(base, buf + i*4));
+    }
+
+    if (!output_ptr || max_results == 0) {
+        return 0;
+    }
+
+    xlive::Session sessions[8];
+    int cap = (int)std::min(max_results, 8u);
+    int count = xlive::IsConnected() ? xlive::SearchSessions(sessions, cap) : 0;
+    if (count < 0) count = 0;
+
+    constexpr uint32_t ENTRY_STRIDE = 1326; // bytes per XSESSION_SEARCHRESULT
+
+    for (int i = 0; i < count; i++) {
+        uint32_t entry = output_ptr + 8 + (uint32_t)i * ENTRY_STRIDE;
+        std::memset(base + entry, 0, ENTRY_STRIDE);
+
+        // XSESSION_INFO: XNKID(8) + XNADDR(36)
+        std::memcpy(base + entry,      sessions[i].xnkid,       8);
+        std::memcpy(base + entry + 8,  sessions[i].host_xnaddr, 36);
+
+        uint8_t filled = sessions[i].current_players;
+        uint8_t maxp   = sessions[i].max_players;
+        uint8_t open   = (maxp > filled) ? (maxp - filled) : 0;
+        *(base + entry + 44) = open;
+        *(base + entry + 46) = filled;
+
+        XNADDR_LAN host_addr;
+        std::memcpy(&host_addr, sessions[i].host_xnaddr, sizeof(XNADDR_LAN));
+        AddOrUpdatePeer(host_addr, sessions[i].xnkid);
+
+        REXLOG_INFO("[XGI] SEARCH result[{}]: xnkid={:02X}{:02X}.. ip={:08X}",
+                    i, sessions[i].xnkid[0], sessions[i].xnkid[1], ntohl(host_addr.ina));
+    }
+
+    // Write result count at output_ptr[0] (big-endian)
+    GuestWriteU32(base, output_ptr, (uint32_t)count);
+    REXLOG_INFO("[XGI] SEARCH found {} sessions", count);
+    fprintf(stderr, "[XGI] SEARCH found %d sessions\n", count);
+    fflush(stderr);
+    return 0;
+}
+
+// ---- XGISessionDelete (0x000B0011) ----
+static rex::X_HRESULT HandleXgiDelete(uint8_t* /*base*/, uint32_t /*buf*/, uint32_t /*len*/) {
+    {
+        std::lock_guard<std::mutex> lk(g_session_mutex);
+        g_session_active = false;
+    }
+    // DO NOT unregister from relay here.
+    //
+    // The game calls XGISessionDelete as part of normal Live session lifecycle —
+    // it fires immediately after JoinLocal during hosting setup, while the host
+    // is still in the lobby waiting for players. Unregistering here removes the
+    // session from the relay before any client can discover it.
+    //
+    // The relay session stays alive until the TCP connection drops (app exit or
+    // disconnect), which is the correct cleanup point for a hosted game.
+    fprintf(stderr, "[XGI] DELETE: keeping relay session alive until exit\n");
+    fflush(stderr);
+    REXLOG_INFO("[XGI] DELETE ok (relay session kept)");
+    return 0;
+}
+
+// Override XMsgStartIORequest to intercept XGI session management messages.
+// All other messages are forwarded to the AppManager as normal.
+extern "C" PPC_FUNC(__imp__XMsgStartIORequest) {
+    uint32_t app_id         = ctx.r3.u32;
+    uint32_t message        = ctx.r4.u32;
+    uint32_t overlapped_ptr = ctx.r5.u32;
+    uint32_t buffer_ptr     = ctx.r6.u32;
+    uint32_t buffer_length  = ctx.r7.u32;
+
+    // Drain any deferred SEARCH completions that are ready.
+    // MUST be done on a guest thread (this function) where kernel_state() is
+    // valid.  The discovery thread is a raw std::thread where kernel_state()
+    // returns null, so we cannot call CompleteOverlappedDeferred from there.
+    {
+        std::vector<PendingOverlappedCompletion> to_fire;
+        {
+            auto now = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lk(g_pending_ov_mutex);
+            for (auto it = g_pending_ov.begin(); it != g_pending_ov.end(); ) {
+                if (now >= it->fire_at) {
+                    to_fire.push_back(*it);
+                    it = g_pending_ov.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& pending : to_fire) {
+            REXLOG_INFO("[XGI] SEARCH: completing overlapped 0x{:08X} result=0x{:08X} (immediate, 150ms delayed)",
+                        pending.overlapped_ptr, pending.result);
+            // Use CompleteOverlappedImmediate — NOT Deferred — because the SEARCH
+            // overlapped was never registered with DispatchMessageAsync, so Deferred
+            // crashes trying to look it up in internal state.  Immediate fires the
+            // guest callback (sub_8218A068) directly on this thread.  The 150ms delay
+            // above ensures overlapped+8 (context/callback object) is initialised
+            // before we arrive here, so sub_8218A068 can safely dereference it.
+            rex::kernel::kernel_state()->CompleteOverlappedImmediate(
+                pending.overlapped_ptr, pending.result);
+        }
+    }
+
+    REXLOG_INFO("[XMsg] app={} msg=0x{:08X} buf=0x{:08X} len={}",
+                app_id, message, buffer_ptr, buffer_length);
+
+    rex::X_HRESULT result = 0;
+
+    if (app_id == 251) {
+        switch (message) {
+        case 0x000B0010:
+            result = HandleXgiCreate(base, buffer_ptr, buffer_length);
+            break;
+        case 0x000B001C:
+            result = HandleXgiSearch(base, buffer_ptr, buffer_length);
+            // Delay the overlapped completion by 150 ms so the game's main
+            // thread has time to store the callback object at overlapped+8
+            // before sub_8218A068 tries to invoke it.  Without the delay the
+            // kernel dispatch fires the completion almost immediately and the
+            // callback pointer (overlapped+8) is still 0x44 (uninitialised),
+            // causing a crash when sub_8218A068 dereferences it as a vtable.
+            if (overlapped_ptr) {
+                {
+                    std::lock_guard<std::mutex> lk(g_pending_ov_mutex);
+                    g_pending_ov.push_back({
+                        overlapped_ptr,
+                        (uint32_t)result,
+                        std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(150)
+                    });
+                }
+                REXLOG_INFO("[XGI] SEARCH: deferred overlapped 0x{:08X} by 150ms",
+                            overlapped_ptr);
+                ctx.r3.u64 = 0x00000103; // X_ERROR_IO_PENDING
+            } else {
+                ctx.r3.u64 = (uint64_t)(uint32_t)result;
+            }
+            return; // Skip the common CompleteOverlappedDeferred below
+        case 0x000B0011:
+            result = HandleXgiDelete(base, buffer_ptr, buffer_length);
+            break;
+        default:
+            // Forward to existing SDK XgiApp handler
+            result = rex::kernel::kernel_state()->app_manager()->DispatchMessageAsync(
+                app_id, message, buffer_ptr, buffer_length);
+            break;
+        }
+    } else {
+        result = rex::kernel::kernel_state()->app_manager()->DispatchMessageAsync(
+            app_id, message, buffer_ptr, buffer_length);
+    }
+
+    // Complete the overlapped DEFERRED (not immediate).
+    // CompleteOverlappedImmediate fires the game's callback synchronously from
+    // inside this handler, before the caller has a chance to store its callback
+    // object into overlapped+8 — causing a null-deref crash in sub_8218A068.
+    // Deferred queues the completion to run after this call returns, by which
+    // time the game has fully initialised the overlapped/session struct.
+    if (overlapped_ptr) {
+        rex::kernel::kernel_state()->CompleteOverlappedDeferred(
+            []() {}, overlapped_ptr, result);
+        ctx.r3.u64 = 0x00000103; // X_ERROR_IO_PENDING
+    } else {
+        ctx.r3.u64 = (uint64_t)(uint32_t)result;
+    }
+}
 
 // ============================================================================
 // LAN IP detection
@@ -115,17 +460,59 @@ static uint32_t GetLocalLanIP() {
         return htonl(INADDR_LOOPBACK);
     }
 
+    // Prefer real private LAN addresses over VPN tunnels (Tailscale, etc.)
+    // Priority: 192.168.x.x / 10.x.x.x / 172.16-31.x.x > anything else > loopback
+    // Tailscale uses CGNAT 100.64.0.0/10 — skip it unless it's the only option.
+    auto is_tailscale = [](uint32_t h) {
+        // 100.64.0.0/10 = 100.64.0.0 – 100.127.255.255
+        return (h & 0xFFC00000u) == 0x64400000u;
+    };
+    auto is_private = [](uint32_t h) {
+        return ((h & 0xFF000000u) == 0x0A000000u) ||  // 10.x.x.x
+               ((h & 0xFFF00000u) == 0xAC100000u) ||  // 172.16-31.x.x
+               ((h & 0xFFFF0000u) == 0xC0A80000u);    // 192.168.x.x
+    };
+
     uint32_t chosen_ip = htonl(INADDR_LOOPBACK);
+    uint32_t fallback_ip = 0;  // non-loopback, non-private, non-tailscale
+
     for (auto* ai = result; ai; ai = ai->ai_next) {
-        if (ai->ai_family == AF_INET) {
-            auto* sin = (struct sockaddr_in*)ai->ai_addr;
-            uint32_t ip = sin->sin_addr.s_addr;
-            // Skip loopback
-            if ((ntohl(ip) & 0xFF000000) == 0x7F000000) continue;
-            chosen_ip = ip;
-            break;
+        if (ai->ai_family != AF_INET) continue;
+        auto* sin = (struct sockaddr_in*)ai->ai_addr;
+        uint32_t ip_net = sin->sin_addr.s_addr;
+        uint32_t h = ntohl(ip_net);
+        if ((h & 0xFF000000u) == 0x7F000000u) continue;  // loopback
+        if (is_private(h)) {
+            chosen_ip = ip_net;
+            break;  // preferred — take immediately
+        }
+        if (!is_tailscale(h) && !fallback_ip)
+            fallback_ip = ip_net;
+    }
+
+    // If no private address found, fall back (non-Tailscale first, then Tailscale)
+    if (ntohl(chosen_ip) == INADDR_LOOPBACK) {
+        if (fallback_ip)
+            chosen_ip = fallback_ip;
+        else {
+            // Last resort: accept Tailscale if that's all we have
+            for (auto* ai = result; ai; ai = ai->ai_next) {
+                if (ai->ai_family != AF_INET) continue;
+                auto* sin = (struct sockaddr_in*)ai->ai_addr;
+                uint32_t ip_net = sin->sin_addr.s_addr;
+                uint32_t h = ntohl(ip_net);
+                if ((h & 0xFF000000u) == 0x7F000000u) continue;
+                chosen_ip = ip_net;
+                break;
+            }
         }
     }
+
+    char ip_str[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &chosen_ip, ip_str, sizeof(ip_str));
+    fprintf(stderr, "[NET] Local LAN IP selected: %s\n", ip_str);
+    fflush(stderr);
+
     freeaddrinfo(result);
     return chosen_ip;
 }
@@ -281,19 +668,33 @@ static std::vector<BeaconResponse> CollectBeaconResponses(
 // ============================================================================
 
 static void DiscoveryThreadFunc() {
+    g_disc_step.store(1, std::memory_order_relaxed);
+    fprintf(stderr, "[DISC] step 1: thread entry\n"); fflush(stderr);
     REXLOG_INFO("[NET] Discovery thread started on port {}", g_lan_port);
+    fprintf(stderr, "[DISC] step 1b: past REXLOG, entering loop\n"); fflush(stderr);
 
     auto last_beacon = std::chrono::steady_clock::now() -
                        std::chrono::seconds(10); // send first beacon immediately
 
+    int iter = 0;
     while (g_disc_running.load(std::memory_order_relaxed)) {
-        // Check for incoming packets
+        iter++;
+        if (iter == 1 || iter % 50 == 0) {
+            fprintf(stderr, "[DISC] iter=%d step=%d\n", iter,
+                    g_disc_step.load(std::memory_order_relaxed));
+            fflush(stderr);
+        }
+
+        // Step 2: Build fd_set and call select
+        g_disc_step.store(2, std::memory_order_relaxed);
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(g_disc_socket, &fds);
         struct timeval tv = {0, 100000}; // 100ms
-
         int sel = select((int)g_disc_socket + 1, &fds, nullptr, nullptr, &tv);
+
+        // Step 3: Process received packet if any
+        g_disc_step.store(3, std::memory_order_relaxed);
         if (sel > 0) {
             uint8_t buf[2048];
             struct sockaddr_in from = {};
@@ -313,22 +714,44 @@ static void DiscoveryThreadFunc() {
                         reply.sin_family = AF_INET;
                         reply.sin_port = htons((uint16_t)g_lan_port);
                         reply.sin_addr.s_addr = from.sin_addr.s_addr;
+                        g_disc_step.store(31, std::memory_order_relaxed);
                         SendBeacon(g_disc_socket, reply);
                     }
                     else if (buf[1] == DISC_BEACON && n >= DISC_HEADER_LEN + 2) {
                         // Received a beacon — add/update peer
                         uint8_t* xnkid = buf + 2;
+                        g_disc_step.store(32, std::memory_order_relaxed);
                         AddOrUpdatePeer(*sender_addr, xnkid);
                     }
                 }
             }
         }
 
-        // Broadcast beacons periodically if hosting (QoS listener active)
+        // Step 4: Fire any pending deferred QoS completions.
+        g_disc_step.store(4, std::memory_order_relaxed);
+        {
+            auto now2 = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lock(g_pending_qos_mutex);
+            for (auto it = g_pending_qos.begin(); it != g_pending_qos.end(); ) {
+                if (now2 >= it->ready_at && g_base) {
+                    // Set cxnqosPending = 0 → game will fire completion callback
+                    GuestWriteU32(g_base, it->qos_addr + 4, 0);
+                    fprintf(stderr, "[NET] QoS deferred complete: XNQOS@0x%08X\n", it->qos_addr);
+                    fflush(stderr);
+                    it = g_pending_qos.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        // Step 5: Broadcast beacons periodically if hosting (QoS listener active)
+        g_disc_step.store(5, std::memory_order_relaxed);
         auto now = std::chrono::steady_clock::now();
         auto since_beacon = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - last_beacon);
         if (since_beacon.count() >= 500) {
+            g_disc_step.store(51, std::memory_order_relaxed);
             struct sockaddr_in bcast = {};
             bcast.sin_family = AF_INET;
             bcast.sin_port = htons((uint16_t)g_lan_port);
@@ -336,6 +759,8 @@ static void DiscoveryThreadFunc() {
             SendBeacon(g_disc_socket, bcast);
             last_beacon = now;
         }
+
+        g_disc_step.store(6, std::memory_order_relaxed);
     }
 
     REXLOG_INFO("[NET] Discovery thread stopped");
@@ -345,7 +770,7 @@ static void DiscoveryThreadFunc() {
 // Init / Shutdown
 // ============================================================================
 
-void NetInit(int lan_port) {
+void NetInit(int lan_port, bool relay_enabled, const char* relay_host, int relay_port) {
     g_lan_port = lan_port;
 
 #ifdef _WIN32
@@ -396,10 +821,32 @@ void NetInit(int lan_port) {
     g_disc_running.store(true, std::memory_order_release);
     g_disc_thread = std::thread(DiscoveryThreadFunc);
 
+    // Connect to relay server if enabled
+    if (relay_enabled && relay_host && *relay_host) {
+        const uint8_t* xnaddr_bytes = reinterpret_cast<const uint8_t*>(&g_local_xnaddr);
+        if (xlive::Connect(relay_host, (uint16_t)relay_port,
+                           VIG8_TITLE_ID, xnaddr_bytes, "Player")) {
+            REXLOG_INFO("[NET] Connected to relay {}:{}", relay_host, relay_port);
+            fprintf(stderr, "[NET] Connected to relay %s:%d\n", relay_host, relay_port);
+        } else {
+            REXLOG_ERROR("[NET] Failed to connect to relay {}:{}", relay_host, relay_port);
+            fprintf(stderr, "[NET] FAILED to connect to relay %s:%d\n", relay_host, relay_port);
+        }
+        fflush(stderr);
+    } else if (!relay_enabled) {
+        fprintf(stderr, "[NET] Relay disabled (relay_enabled=false in settings)\n");
+        fflush(stderr);
+    }
+
     REXLOG_INFO("[NET] LAN networking initialized");
 }
 
 void NetShutdown() {
+    // Disconnect from relay
+    if (xlive::IsConnected()) {
+        xlive::Disconnect();
+    }
+
     // Stop discovery thread
     g_disc_running.store(false, std::memory_order_release);
     if (g_disc_thread.joinable()) {
@@ -644,144 +1091,109 @@ extern "C" PPC_FUNC(__imp__NetDll_XNetQosListen) {
     ctx.r3.u64 = 0;
 }
 
-// XNetQosLookup: complex function with stack parameters
-// r4=cxna, r5=apxna, r6=apxnkid, r7=apxnkey, r8=cina, r9=aina, r10=aProbeFlags
-// stack+84=dwBitsPerSec, stack+92=cProbes, stack+100=dwTimeout, stack+108=ppxnqos
+// XNetQosLookup (internal: __imp__NetDll_XNetQosLookup)
+//
+// Called via wrapper sub_821B3FD0 which prepends r3=1 and reshuffles args.
+// At call time:
+//   r3=1 (module), r4=cxna, r5=apxna, r6=apxnkid, r7=apxnkey
+//   r8=cina, r9=aina, r10=adwBitsPerSec
+//   sp+84=cProbes, sp+92=dwTimeout, sp+100=?, sp+108=pXoverlapped
+//   sp+116=ppxnqos  ← game stores r27=r31+104 here (address of XNQOS* field)
+//
+// The game expects us to write an XNQOS* into *(ppxnqos). On the next
+// iteration the game checks *(ppxnqos) != 0 && cxnqosPending == 0
+// and then calls the completion callback.  We skip the UDP probe entirely
+// and return fake-but-valid QoS data immediately.
 extern "C" PPC_FUNC(__imp__NetDll_XNetQosLookup) {
-    uint32_t cxna        = ctx.r4.u32;
-    uint32_t apxna       = ctx.r5.u32;
-    uint32_t apxnkid     = ctx.r6.u32;
-    // r7=apxnkey, r8=cina, r9=aina, r10=aProbeFlags (unused for LAN)
-    // Stack parameters
-    // uint32_t dwBitsPerSec = PPC_LOAD_U32(ctx.r1.u32 + 84);
-    // uint32_t cProbes      = PPC_LOAD_U32(ctx.r1.u32 + 92);
-    uint32_t dwTimeout    = PPC_LOAD_U32(ctx.r1.u32 + 100);
-    uint32_t ppxnqos      = PPC_LOAD_U32(ctx.r1.u32 + 108);
+    g_base = base;  // store for use by the deferred-completion thread
 
-    REXLOG_INFO("[NET] XNetQosLookup: cxna={}, timeout={}, ppxnqos=0x{:08X}",
-                cxna, dwTimeout, ppxnqos);
+    uint32_t cxna    = ctx.r4.u32;
+    // sp+116 = ppxnqos (address of the XNQOS* field in the session struct)
+    uint32_t ppxnqos = PPC_LOAD_U32(ctx.r1.u32 + 116);
 
-    // Read target XNKID(s) for probe
-    uint8_t target_kid[8] = {};
-    if (apxnkid && cxna > 0) {
-        std::memcpy(target_kid, base + apxnkid, 8);
-    }
+    fprintf(stderr, "[NET] XNetQosLookup: cxna=%u ppxnqos=0x%08X\n", cxna, ppxnqos);
+    fflush(stderr);
+    REXLOG_INFO("[NET] XNetQosLookup: cxna={}, ppxnqos=0x{:08X}", cxna, ppxnqos);
 
-    // Send probe(s) on discovery socket
-    if (g_disc_socket != (SOCKET)INVALID_SOCKET) {
-        SendProbe(g_disc_socket, target_kid);
-    }
-
-    // Collect responses (use short timeout — LAN latency is <1ms)
-    int collect_timeout = (dwTimeout > 0 && dwTimeout < 500) ? (int)dwTimeout : 200;
-    std::vector<BeaconResponse> responses;
-    if (g_disc_socket != (SOCKET)INVALID_SOCKET) {
-        responses = CollectBeaconResponses(g_disc_socket, collect_timeout);
-    }
-
-    // Also check for responses matching specific target addresses
-    if (apxna && cxna > 0 && responses.empty()) {
-        // If we got no broadcast responses, try to find matching peers
-        std::shared_lock lock(g_peers_mutex);
-        for (uint32_t i = 0; i < cxna; i++) {
-            XNADDR_LAN addr;
-            std::memcpy(&addr, base + apxna + i * sizeof(XNADDR_LAN),
-                        sizeof(XNADDR_LAN));
-            auto* peer = FindPeerByIP(addr.ina);
-            if (peer) {
-                // Peer known but no beacon received — still include in results
-                // with empty QoS data (the game may handle this)
-            }
-        }
-    }
-
-    uint32_t count = (uint32_t)responses.size();
-
-    // Allocate XNQOS result structure in guest memory
-    // Layout:
-    //   +0  uint32_t count
-    //   +4  uint32_t count_pending (0 = complete)
-    //   +8  XNQOSINFO[count] (24 bytes each)
-    //   After entries: QoS data blobs
-    //
-    // XNQOSINFO (24 bytes):
-    //   +0  uint8_t  bFlags
-    //   +1  uint8_t  bReserved
-    //   +2  uint16_t cProbesXmit
-    //   +4  uint16_t cProbesRecv
-    //   +6  uint16_t cbData
-    //   +8  uint32_t pbData (guest ptr)
-    //   +12 uint16_t wRttMedian
-    //   +14 uint16_t wRttMinimum
-    //   +16 uint32_t dwUpBitsPerSec
-    //   +20 uint32_t dwDnBitsPerSec
-
-    auto* mem = rex::kernel::kernel_state()->memory();
-    uint32_t header_size = 8;
-    uint32_t entry_size = 24;
-    uint32_t entries_size = count * entry_size;
-
-    // Calculate total data blob sizes
-    uint32_t total_data = 0;
-    for (auto& r : responses) total_data += r.qos_data_len;
-
-    uint32_t alloc_size = header_size + entries_size + total_data;
-    if (alloc_size < 8) alloc_size = 8; // minimum allocation
-
-    uint32_t qos_addr = mem->SystemHeapAlloc(alloc_size, 0x10);
-    if (!qos_addr) {
-        REXLOG_ERROR("[NET] Failed to allocate XNQOS ({} bytes)", alloc_size);
-        ctx.r3.u64 = 0x8007000E; // E_OUTOFMEMORY
+    if (cxna == 0 || !ppxnqos) {
+        // No sessions to probe or no output pointer — nothing to do.
+        ctx.r3.u64 = 0;
         return;
     }
 
-    // Zero the entire allocation
+    auto* mem = rex::kernel::kernel_state()->memory();
+
+    // Free any previous XNQOS allocation at this slot.
+    uint32_t prev = PPC_LOAD_U32(ppxnqos);
+    if (prev) {
+        mem->SystemHeapFree(prev);
+        PPC_STORE_U32(ppxnqos, 0);
+    }
+
+    // Allocate XNQOS result structure in guest memory.
+    // Layout:
+    //   +0  uint32_t cxnqos        (number of results)
+    //   +4  uint32_t cxnqosPending (N = still pending; 0 = complete)
+    //   +8  XNQOSINFO[cxna] (24 bytes each):
+    //     +0  uint8_t  bFlags
+    //     +1  uint8_t  bReserved
+    //     +2  uint16_t cProbesXmit
+    //     +4  uint16_t cProbesRecv
+    //     +6  uint16_t cbData
+    //     +8  uint32_t pbData (guest ptr, NULL if no data)
+    //     +12 uint16_t wRttMedian
+    //     +14 uint16_t wRttMinimum
+    //     +16 uint32_t dwUpBitsPerSec
+    //     +20 uint32_t dwDnBitsPerSec
+    uint32_t alloc_size = 8 + cxna * 24;
+    uint32_t qos_addr = mem->SystemHeapAlloc(alloc_size, 0x10);
+    if (!qos_addr) {
+        REXLOG_ERROR("[NET] XNetQosLookup: alloc failed ({} bytes)", alloc_size);
+        ctx.r3.u64 = 0x8007000E; // E_OUTOFMEMORY
+        return;
+    }
     std::memset(base + qos_addr, 0, alloc_size);
 
-    // Write header
-    PPC_STORE_U32(qos_addr + 0, count);       // cxnqos
-    PPC_STORE_U32(qos_addr + 4, 0);           // cxnqosPending = 0 (complete)
+    // Header: cxnqos = cxna, cxnqosPending = cxna (NOT 0 yet).
+    // The discovery thread will set cxnqosPending = 0 after a short delay,
+    // giving the game time to fully initialise the session struct (including
+    // the completion-callback object at session_struct+8) before we trigger
+    // the callback path through sub_8218A068.
+    PPC_STORE_U32(qos_addr + 0, cxna);   // cxnqos
+    PPC_STORE_U32(qos_addr + 4, cxna);   // cxnqosPending = cxna (pending)
 
-    // Write entries and copy data blobs
-    uint32_t data_offset = header_size + entries_size;
-    for (uint32_t i = 0; i < count; i++) {
-        auto& r = responses[i];
-        uint32_t entry_addr = qos_addr + header_size + i * entry_size;
-        uint32_t data_addr = qos_addr + data_offset;
-
-        // bFlags: 0x01 (COMPLETE) | 0x02 (TARGET)
-        PPC_STORE_U8(entry_addr + 0, 0x03);
-        // bReserved
-        PPC_STORE_U8(entry_addr + 1, 0);
-        // cProbesXmit / cProbesRecv
-        PPC_STORE_U16(entry_addr + 2, 1);
-        PPC_STORE_U16(entry_addr + 4, 1);
-        // cbData
-        PPC_STORE_U16(entry_addr + 6, r.qos_data_len);
-        // pbData (guest pointer)
-        if (r.qos_data_len > 0) {
-            PPC_STORE_U32(entry_addr + 8, data_addr);
-            std::memcpy(base + data_addr, r.qos_data, r.qos_data_len);
-            data_offset += r.qos_data_len;
-        } else {
-            PPC_STORE_U32(entry_addr + 8, 0);
-        }
-        // wRttMedian / wRttMinimum (1ms — LAN)
-        PPC_STORE_U16(entry_addr + 12, 1);
-        PPC_STORE_U16(entry_addr + 14, 1);
-        // dwUpBitsPerSec / dwDnBitsPerSec (10 Mbps)
-        PPC_STORE_U32(entry_addr + 16, 10000000);
-        PPC_STORE_U32(entry_addr + 20, 10000000);
+    // Fill each entry with good fake stats.
+    // bFlags: XNET_XNQOSINFO_COMPLETE(0x01) | XNET_XNQOSINFO_TARGET_CONTACTED(0x02)
+    for (uint32_t i = 0; i < cxna; i++) {
+        uint32_t e = qos_addr + 8 + i * 24;
+        PPC_STORE_U8 (e +  0, 0x03);      // bFlags
+        PPC_STORE_U8 (e +  1, 0);         // bReserved
+        PPC_STORE_U16(e +  2, 4);         // cProbesXmit
+        PPC_STORE_U16(e +  4, 4);         // cProbesRecv
+        PPC_STORE_U16(e +  6, 0);         // cbData (no QoS blob)
+        PPC_STORE_U32(e +  8, 0);         // pbData = NULL
+        PPC_STORE_U16(e + 12, 30);        // wRttMedian  (30 ms)
+        PPC_STORE_U16(e + 14, 20);        // wRttMinimum (20 ms)
+        PPC_STORE_U32(e + 16, 10000000);  // dwUpBitsPerSec (10 Mbps)
+        PPC_STORE_U32(e + 20, 10000000);  // dwDnBitsPerSec (10 Mbps)
     }
 
-    // Write XNQOS pointer to guest output
-    if (ppxnqos) {
-        PPC_STORE_U32(ppxnqos, qos_addr);
+    // Write XNQOS pointer into *ppxnqos (= session_struct+104).
+    PPC_STORE_U32(ppxnqos, qos_addr);
+
+    // Schedule deferred completion: set cxnqosPending = 0 after 300 ms.
+    {
+        std::lock_guard<std::mutex> lock(g_pending_qos_mutex);
+        g_pending_qos.push_back({qos_addr,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(300)});
     }
 
-    REXLOG_INFO("[NET] QoS lookup complete: {} results, alloc=0x{:08X}",
-                count, qos_addr);
-    ctx.r3.u64 = 0;
+    fprintf(stderr, "[NET] XNetQosLookup: XNQOS@0x%08X pending (cxna=%u), completing in 300ms\n",
+            qos_addr, cxna);
+    fflush(stderr);
+    REXLOG_INFO("[NET] XNetQosLookup: XNQOS@0x{:08X} pending -> *ppxnqos(0x{:08X})", qos_addr, ppxnqos);
+
+    ctx.r3.u64 = 0;  // ERROR_SUCCESS
 }
 
 // XNetQosRelease(r4=xnqos_ptr) -> 0
@@ -1009,4 +1421,39 @@ extern "C" PPC_FUNC(__imp__NetDll_WSAGetOverlappedResult) {
         // Still no data
         ctx.r3.u64 = 0; // FALSE = incomplete
     }
+}
+
+// ============================================================================
+// sub_8218A068 guard — prevent vtable dispatch on invalid callback pointer
+// ============================================================================
+//
+// sub_8218A068 fires a completion callback when r7=0 by doing a vtable
+// dispatch through r3 (= *(session_struct+8) = callback object pointer).
+// If r3 is a near-null value (0, 0x44, etc.), reading *(r3+12) crashes at
+// base+0x50. This happens from sub_821969E8 when XNetQosLookup writes
+// XNQOS with cxnqosPending=0 before the game has initialized the callback.
+// Guard: if r3 < 0x10000, inhibit the vtable call (set r7=1).
+
+extern "C" void __imp__sub_8218A068(PPCContext& ctx, uint8_t* base);
+extern "C" PPC_FUNC(sub_8218A068) {
+    fprintf(stderr, "[NET] sub_8218A068 called: r7=%u r3=0x%08X\n", ctx.r7.u32, ctx.r3.u32);
+    fflush(stderr);
+    if (ctx.r7.u32 == 0) {
+        uint32_t cb_obj = ctx.r3.u32;
+        if (cb_obj < 0x10000) {
+            fprintf(stderr, "[NET] sub_8218A068: inhibit near-null cb_obj=0x%X\n", cb_obj);
+            fflush(stderr);
+            ctx.r7.u64 = 1;
+        } else {
+            uint32_t vtable_ptr = PPC_LOAD_U32(cb_obj + 12);
+            fprintf(stderr, "[NET] sub_8218A068: cb_obj=0x%X vtable_ptr=0x%X\n", cb_obj, vtable_ptr);
+            fflush(stderr);
+            if (vtable_ptr < 0x10000) {
+                fprintf(stderr, "[NET] sub_8218A068: inhibit bad vtable_ptr\n");
+                fflush(stderr);
+                ctx.r7.u64 = 1;
+            }
+        }
+    }
+    __imp__sub_8218A068(ctx, base);
 }

@@ -6,6 +6,7 @@
 #include "settings.h"
 #include "menu.h"
 #include "net.h"
+#include "keyboard_driver.h"
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -24,6 +25,7 @@
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/ui_event.h>
 #include <rex/ui/virtual_key.h>
+#include <rex/input/input_system.h>
 
 #include <imgui.h>
 
@@ -37,6 +39,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstdarg>
+#include <atomic>
 #include <mutex>
 
 static FILE* g_crash_log = nullptr;
@@ -45,7 +48,7 @@ static std::mutex g_crash_mutex;
 static void crash_log_write(const char* fmt, ...) {
     std::lock_guard<std::mutex> lock(g_crash_mutex);
     if (!g_crash_log) {
-        g_crash_log = fopen("E:\\vig8\\vig8_crash.log", "a");
+        g_crash_log = fopen("vig8_crash.log", "a");
         if (!g_crash_log) return;
     }
     va_list ap;
@@ -62,11 +65,11 @@ static void crash_log_write(const char* fmt, ...) {
 // Redirect stderr to a log file for GUI app crash diagnostics
 static struct StderrRedirect_ {
     StderrRedirect_() {
-        freopen("E:\\vig8\\vig8_stderr.log", "w", stderr);
+        freopen("vig8_stderr.log", "w", stderr);
         fprintf(stderr, "[vig8] stderr redirected to log file\n");
         fflush(stderr);
         // Also open dedicated crash log
-        g_crash_log = fopen("E:\\vig8\\vig8_crash.log", "w");
+        g_crash_log = fopen("vig8_crash.log", "w");
         if (g_crash_log) {
             fprintf(g_crash_log, "[vig8] Crash log initialized\n");
             fflush(g_crash_log);
@@ -88,6 +91,9 @@ static struct StderrRedirect_ {
     }
 } g_stderr_redirect_;
 
+// Declared in net.cpp — step counter updated by DiscoveryThreadFunc before each operation
+extern std::atomic<int> g_disc_step;
+
 // VEH handler: log ALL crashes/exceptions (runs on any thread)
 static LONG CALLBACK CrashVEH(EXCEPTION_POINTERS* ep) {
     auto* ctx = ep->ContextRecord;
@@ -97,6 +103,7 @@ static LONG CALLBACK CrashVEH(EXCEPTION_POINTERS* ep) {
         rec->ExceptionCode == EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
     crash_log_write("\n========== EXCEPTION ==========\n");
     crash_log_write("Thread: %lu\n", GetCurrentThreadId());
+    crash_log_write("g_disc_step: %d\n", g_disc_step.load(std::memory_order_relaxed));
     crash_log_write("Exception: 0x%08lX at RIP=0x%016llX\n",
             rec->ExceptionCode, (unsigned long long)ctx->Rip);
     if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION) {
@@ -126,14 +133,29 @@ static LONG CALLBACK CrashVEH(EXCEPTION_POINTERS* ep) {
             ctx->R8, ctx->R9, ctx->R10, ctx->R11);
     crash_log_write("R12=0x%016llX R13=0x%016llX R14=0x%016llX R15=0x%016llX\n",
             ctx->R12, ctx->R13, ctx->R14, ctx->R15);
+
+    // Log instruction bytes at RIP (helps identify the faulting instruction)
     __try {
-        crash_log_write("\nStack (RSP):\n");
-        uint64_t* sp = (uint64_t*)ctx->Rsp;
+        const uint8_t* rip = (const uint8_t*)ctx->Rip;
+        crash_log_write("\nInstruction bytes at RIP:");
         for (int i = 0; i < 16; i++) {
             __try {
-                crash_log_write("  [RSP+%02X] = 0x%016llX\n", i*8, sp[i]);
+                crash_log_write(" %02X", rip[i]);
             } __except(EXCEPTION_EXECUTE_HANDLER) {
-                crash_log_write("  [RSP+%02X] = <unreadable>\n", i*8);
+                crash_log_write(" ??");
+            }
+        }
+        crash_log_write("\n");
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+    __try {
+        crash_log_write("\nStack (RSP, 32 entries):\n");
+        uint64_t* sp = (uint64_t*)ctx->Rsp;
+        for (int i = 0; i < 32; i++) {
+            __try {
+                crash_log_write("  [RSP+%03X] = 0x%016llX\n", i*8, sp[i]);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                crash_log_write("  [RSP+%03X] = <unreadable>\n", i*8);
             }
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {}
@@ -338,9 +360,12 @@ public:
         if (REXCVAR_GET(log_verbose) && log_level_str == "info") {
             log_level_str = "trace";
         }
-        auto log_config = rex::BuildLogConfig(
-            log_file_cvar.empty() ? nullptr : log_file_cvar.c_str(),
-            log_level_str, {});
+        if (log_level_str.empty()) log_level_str = "info";
+        // Always write REXLOG to a file — for WIN32 GUI apps there is no console
+        // so spdlog's default stdout sink produces no visible output.
+        const char* log_file_path =
+            log_file_cvar.empty() ? "vig8_rexlog.log" : log_file_cvar.c_str();
+        auto log_config = rex::BuildLogConfig(log_file_path, log_level_str, {});
         rex::InitLogging(log_config);
         rex::RegisterLogLevelCallback();
         REXLOG_INFO("vig8 starting");
@@ -408,6 +433,14 @@ public:
 
                     runtime_->set_display_window(window_.get());
                     runtime_->set_imgui_drawer(imgui_drawer_.get());
+
+                    // set_display_window triggers SetupInputDrivers, so
+                    // input_system() is valid from this point on.
+                    if (runtime_->kernel_state()->input_system()) {
+                        auto kbd = std::make_unique<KeyboardInputDriver>(window_.get());
+                        kbd->Setup();
+                        runtime_->kernel_state()->input_system()->InsertDriverFront(std::move(kbd));
+                    }
                 }
             }
             window_->SetPresenter(presenter);
@@ -421,8 +454,11 @@ public:
             });
         }
 
-        // Initialize LAN networking (after runtime so kernel_state is available)
-        NetInit(settings_.lan_port);
+        // Initialize LAN networking and optional relay (after runtime so kernel_state is available)
+        NetInit(settings_.lan_port,
+                settings_.relay_enabled,
+                settings_.relay_host.c_str(),
+                settings_.relay_port);
 
         // Launch module in background
         app_context().CallInUIThreadDeferred([this]() {

@@ -35,6 +35,13 @@ VIG8_STUB(__imp__XamShowMarketplaceUI)
 VIG8_STUB_RETURN(__imp__XamUserCreateStatsEnumerator, 1)  // fail = no stats
 VIG8_STUB(__imp__XamVoiceSubmitPacket)
 
+// XamLoaderTerminateTitle / XamLoaderLaunchTitle:
+// On real hardware these return to the dashboard (exit the title).
+// Here we suppress them so a Live session failure doesn't close the app.
+// The user can close the window normally to exit.
+VIG8_STUB(__imp__XamLoaderTerminateTitle)
+VIG8_STUB(__imp__XamLoaderLaunchTitle)
+
 // Content license — override the weak wrapper sub_823245B0 to return full
 // license mask, bypassing the SDK's XamContentGetLicenseMask (which returns
 // no-license). The generated code declares sub_823245B0 as PPC_WEAK_FUNC,
@@ -84,10 +91,12 @@ static const char* kUserNames[4] = {
 };
 
 // XamUserGetSigninState(user_index) -> signin_state
-// Return 1 (signed in locally) for connected user indices only.
+// Return 2 (signed in online / Xbox Live) for connected user indices.
+// Returning 1 (local only) causes the Live game button to do nothing
+// because the game checks for state == 2 before entering the online lobby.
 extern "C" PPC_FUNC(__imp__XamUserGetSigninState) {
     uint32_t user_index = ctx.r3.u32;
-    ctx.r3.u64 = (user_index < 4 && g_vig8_user_connected[user_index]) ? 1 : 0;
+    ctx.r3.u64 = (user_index < 4 && g_vig8_user_connected[user_index]) ? 2 : 0;
 }
 
 // XamUserGetSigninInfo(user_index, flags, info_ptr) -> HRESULT
@@ -117,7 +126,7 @@ extern "C" PPC_FUNC(__imp__XamUserGetSigninInfo) {
     }
 
     PPC_STORE_U64(info_ptr + 0, kUserXuids[user_index]);
-    PPC_STORE_U32(info_ptr + 12, 1);  // signin_state = signed in locally
+    PPC_STORE_U32(info_ptr + 12, 2);  // signin_state = signed in online (Xbox Live)
     // Copy name (raw bytes, not endian-swapped)
     const char* name = kUserNames[user_index];
     std::memcpy(base + info_ptr + 24, name, std::strlen(name) + 1);
@@ -179,8 +188,8 @@ extern "C" PPC_FUNC(__imp__XamUserCheckPrivilege) {
         return;
     }
 
-    // Grant all privileges
-    if (out_ptr) PPC_STORE_U32(out_ptr, 0);
+    // Grant all privileges — write TRUE (1) to pfGranted output
+    if (out_ptr) PPC_STORE_U32(out_ptr, 1);
     ctx.r3.u64 = 0;  // X_ERROR_SUCCESS
 }
 

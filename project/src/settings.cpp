@@ -30,7 +30,10 @@ Vig8Settings LoadSettings(const std::filesystem::path& path) {
         s.connected_4 = tbl["controls"]["connected_4"].value_or(s.connected_4);
 
         // [network]
-        s.lan_port = tbl["network"]["lan_port"].value_or(s.lan_port);
+        s.lan_port      = tbl["network"]["lan_port"].value_or(s.lan_port);
+        s.relay_enabled = tbl["network"]["relay_enabled"].value_or(s.relay_enabled);
+        s.relay_host    = tbl["network"]["relay_host"].value_or(s.relay_host);
+        s.relay_port    = tbl["network"]["relay_port"].value_or(s.relay_port);
 
         // [debug]
         s.show_fps = tbl["debug"]["show_fps"].value_or(s.show_fps);
@@ -70,6 +73,9 @@ void SaveSettings(const std::filesystem::path& path, const Vig8Settings& s) {
 
     f << "[network]\n";
     f << "lan_port = " << s.lan_port << "\n";
+    f << "relay_enabled = " << (s.relay_enabled ? "true" : "false") << "\n";
+    f << "relay_host = " << toml::value<std::string>(s.relay_host) << "\n";
+    f << "relay_port = " << s.relay_port << "\n";
     f << "\n";
 
     f << "[debug]\n";

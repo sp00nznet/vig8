@@ -7,10 +7,14 @@
 #include <cstdint>
 
 // Initialize LAN networking: detect local IP, start discovery thread.
+// Optionally connects to an xlive relay server for internet session discovery.
 // Call after runtime initialization.
-void NetInit(int lan_port);
+void NetInit(int lan_port,
+             bool relay_enabled = false,
+             const char* relay_host = "localhost",
+             int relay_port = 36000);
 
-// Stop discovery thread and clean up sockets.
+// Stop discovery thread, disconnect from relay, and clean up sockets.
 // Call before runtime shutdown.
 void NetShutdown();
 

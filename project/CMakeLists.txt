@@ -28,6 +28,8 @@ else()
 endif()
 
 # Main executable
+set(XLIVE_CLIENT_DIR "${CMAKE_SOURCE_DIR}/../../xlive/client")
+
 if(WIN32)
     add_executable(vig8 WIN32
         src/main.cpp
@@ -35,6 +37,8 @@ if(WIN32)
         src/settings.cpp
         src/menu.cpp
         src/net.cpp
+        src/keyboard_driver.cpp
+        ${XLIVE_CLIENT_DIR}/xlive.cpp
         ${ENTRY_POINT_SRC}
         ${GENERATED_SOURCES}
     )
@@ -45,6 +49,8 @@ else()
         src/settings.cpp
         src/menu.cpp
         src/net.cpp
+        src/keyboard_driver.cpp
+        ${XLIVE_CLIENT_DIR}/xlive.cpp
         ${ENTRY_POINT_SRC}
         ${GENERATED_SOURCES}
     )
@@ -52,6 +58,7 @@ endif()
 
 target_include_directories(vig8 PRIVATE
     ${CMAKE_SOURCE_DIR}/../generated
+    ${XLIVE_CLIENT_DIR}
 )
 
 target_link_libraries(vig8 PRIVATE
